@@ -1,0 +1,28 @@
+:root {
+  --bg: #f6f4ef;
+  --ink: #1a1a1a;
+  --ink-soft: #4a4a4a;
+  --ink-faint: #8a8a8a;
+  --line: #d8d4cc;
+  --line-soft: #e8e4dc;
+  --accent: #c0392b;
+  --paper: #fbfaf6;
+
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-serif: 'Fraunces', Georgia, serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --radius: 8px;
+  --radius-sm: 6px;
+}
+
+[data-theme="dark"] {
+  --bg: #1e1e1e;
+  --ink: #e4e2dd;
+  --ink-soft: #b0ada6;
+  --ink-faint: #7a7770;
+  --line: #3a3835;
+  --line-soft: #2e2c29;
+  --accent: #e74c3c;
+  --paper: #272725;
+}
