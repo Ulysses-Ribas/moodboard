@@ -1,6 +1,6 @@
 export interface BoardItem {
   id: string;
-  type: 'image' | 'text' | 'link' | 'color' | 'note' | 'frame' | 'board' | 'draw';
+  type: 'image' | 'text' | 'link' | 'color' | 'note' | 'frame' | 'board' | 'draw' | 'embed';
   content: string;
   color?: string;
   /** Stroke width for draw items */
@@ -43,6 +43,25 @@ export interface Board {
 export interface BoardRef {
   boardId: string;
   boardName: string;
+}
+
+export interface Profile {
+  id: string;
+  email: string;
+  display_name: string;
+  avatar_url: string | null;
+  color: string;
+  is_admin: boolean;
+  created_at: string;
+}
+
+export interface Comment {
+  id: string;
+  board_id: string;
+  item_id: string;
+  profile_id: string;
+  content: string;
+  created_at: string;
 }
 
 export interface BoardState {

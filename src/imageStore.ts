@@ -92,6 +92,11 @@ export async function migrateInlineImages(boards: { items: { type: string; conte
         item.content = ref;
         migrated = true;
       }
+      if (item.type === 'embed' && !item.content.startsWith('idb://') && !item.content.startsWith('http')) {
+        const ref = await saveImage(item.content);
+        item.content = ref;
+        migrated = true;
+      }
     }
   }
   return migrated;

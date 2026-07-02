@@ -1,5 +1,5 @@
 ﻿import './style.css';
-import type { BoardItem, Board } from './types';
+import type { BoardItem, Board, Profile } from './types';
 import { loadState, saveState, createBoard } from './state';
 import { initCanvas, screenToBoard, boardToScreen, isSpaceHeld } from './canvas';
 import { createItem, duplicateItem } from './items';
@@ -26,9 +26,64 @@ import { calcSnap, initGuideLayer, drawGuides, clearGuides } from './snap';
 import { createConnectionLayer, getCenter, getAnchor } from './connections';
 import { generateId } from './items';
 import { saveImage, migrateInlineImages, isIdbRef, getImage } from './imageStore';
+import { supabase } from './supabase';
+import { initAuth, getAuth, signOut } from './auth';
+import { renderLogin } from './loginView';
+import { renderAdmin } from './adminView';
+import {
+  loadBoardsFromSupabase,
+  saveBoardToSupabase,
+  debouncedSave,
+  migrateLocalBoards,
+  resyncIdbContent,
+  subscribeToBoardChanges,
+  getBoardRole,
+  type BoardRole,
+} from './boardStore';
+import {
+  joinBoard,
+  leaveBoard,
+  broadcastCursor,
+  broadcastCursorPos,
+  broadcastViewport,
+  onPresenceChange,
+  onRemoteCursor,
+  startFollowing,
+  stopFollowing,
+  getFollowingUserId,
+  checkFollowUpdate,
+  getOnlineUsers,
+  type PresenceState,
+  type FollowTarget,
+} from './presence';
+import {
+  loadCommentCounts,
+  loadComments,
+  addComment,
+  deleteComment,
+  subscribeToComments,
+  unsubscribeComments,
+  getCommentCount,
+  type CommentWithAuthor,
+} from './comments';
+import {
+  saveSnapshot,
+  getSnapshots,
+  deleteSnapshot,
+  restoreBoardFromSnapshot,
+  startAutoSnapshot,
+  stopAutoSnapshot,
+} from './versionHistory';
 
 const app = document.getElementById('app')!;
 const state = loadState();
+let currentProfile: Profile | null = null;
+let currentBoardRole: BoardRole = 'owner';
+let isPublicView = false;
+
+function isReadOnly(): boolean {
+  return currentBoardRole === 'viewer';
+}
 
 // --- Theme ---
 function initTheme() {
@@ -160,10 +215,16 @@ function snapshot() {
 }
 
 function save() {
+  if (isReadOnly()) return;
   saveState(state);
+  if (currentProfile) {
+    const board = getActiveBoard();
+    if (board) debouncedSave(board, currentProfile.id);
+  }
 }
 
 function commit() {
+  if (isReadOnly()) return;
   const board = getActiveBoard();
   board.updatedAt = Date.now();
   snapshot();
@@ -172,6 +233,15 @@ function commit() {
 }
 
 let _onViewportChange: (() => void) | null = null;
+
+let _presenceTimer: ReturnType<typeof setTimeout> | null = null;
+function throttledPresenceUpdate(profile: Profile, viewport: { x: number; y: number; zoom: number }) {
+  if (_presenceTimer) return;
+  _presenceTimer = setTimeout(() => {
+    _presenceTimer = null;
+    broadcastCursor(null, profile, viewport);
+  }, 3000);
+}
 
 function rerender() {
   removeSelectionToolbar();
@@ -666,8 +736,15 @@ function getFrameChildren(frame: BoardItem): BoardItem[] {
 async function addImageFromFile(file: File, screenX?: number, screenY?: number) {
   const { dataUrl, width, height } = await compressImage(file);
 
-  // Save image to IndexedDB and get a lightweight reference
-  const ref = await saveImage(dataUrl);
+  // Upload to Supabase Storage if logged in, fall back to IndexedDB
+  let ref: string;
+  if (currentProfile) {
+    const { uploadImageToStorage } = await import('./storageUpload');
+    const url = await uploadImageToStorage(dataUrl, currentProfile.id);
+    ref = url || await saveImage(dataUrl);
+  } else {
+    ref = await saveImage(dataUrl);
+  }
 
   // Fit item to a max board size of 320px on the longest side, keeping aspect ratio
   const ITEM_MAX = 320;
@@ -700,6 +777,99 @@ async function addImageFromFile(file: File, screenX?: number, screenY?: number) 
   selectOnly(item.id);
   commit();
   rerender();
+}
+
+async function addEmbedFromFile(file: File, screenX?: number, screenY?: number) {
+  const html = await file.text();
+  const ref = await saveImage(html);
+
+  const vp = getViewport();
+  const rect = getCanvasRect();
+  const itemW = 800;
+  const itemH = 500;
+  let pos: { x: number; y: number };
+  if (screenX != null && screenY != null) {
+    const bp = screenToBoard(screenX - rect.left, screenY - rect.top, vp);
+    pos = { x: bp.x - itemW / 2, y: bp.y - itemH / 2 };
+  } else {
+    const center = screenToBoard(rect.width / 2, rect.height / 2, vp);
+    pos = { x: center.x - itemW / 2, y: center.y - itemH / 2 };
+  }
+
+  const item = createItem('embed', pos, ref);
+  item.sourceUrl = file.name.replace(/\.\w+$/, '');
+  item.size = { w: itemW, h: itemH };
+  getActiveBoard().items.push(item);
+  selectOnly(item.id);
+  commit();
+  rerender();
+}
+
+let embedFullscreenOverlay: HTMLElement | null = null;
+
+function openEmbedFullscreen(itemId: string) {
+  const item = findItem(itemId);
+  if (!item || item.type !== 'embed') return;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'embed-fullscreen-overlay';
+
+  const topBar = document.createElement('div');
+  topBar.className = 'embed-fullscreen-bar';
+
+  const title = document.createElement('span');
+  title.className = 'embed-fullscreen-title';
+  title.textContent = item.sourceUrl || 'Embed HTML';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'embed-fullscreen-close';
+  closeBtn.title = 'Fechar (Esc)';
+  closeBtn.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+
+  topBar.append(title, closeBtn);
+
+  const iframe = document.createElement('iframe');
+  iframe.className = 'embed-fullscreen-iframe';
+  iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+
+  if (isIdbRef(item.content)) {
+    getImage(item.content).then(html => {
+      if (html) iframe.srcdoc = html;
+    });
+  } else if (item.content.startsWith('http')) {
+    iframe.src = item.content;
+  } else {
+    iframe.srcdoc = item.content;
+  }
+
+  // Click outside iframe (on the dark bar/overlay edges) refocuses the parent
+  overlay.addEventListener('mousedown', (e) => {
+    if (e.target === overlay || (e.target as HTMLElement).closest('.embed-fullscreen-bar')) {
+      window.focus();
+    }
+  });
+
+  overlay.append(topBar, iframe);
+  document.body.appendChild(overlay);
+  embedFullscreenOverlay = overlay;
+
+  function closeFullscreen() {
+    overlay.remove();
+    embedFullscreenOverlay = null;
+    document.removeEventListener('keydown', onEscKey, true);
+    window.focus();
+  }
+
+  function onEscKey(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeFullscreen();
+    }
+  }
+
+  document.addEventListener('keydown', onEscKey, true);
+  closeBtn.addEventListener('click', closeFullscreen);
 }
 
 function zoomToFit() {
@@ -962,9 +1132,39 @@ function startPresentation() {
   mask.className = 'present-mask';
   canvasEl.appendChild(mask);
 
-  // Block pan/zoom/drag during presentation
+  // Hint that shows when iframe has focus
+  const embedHint = document.createElement('div');
+  embedHint.className = 'present-embed-hint';
+  embedHint.textContent = 'Clique fora do embed para navegar · Esc para sair';
+  document.body.appendChild(embedHint);
+
+  let embedFocused = false;
+  function setEmbedFocused(focused: boolean) {
+    embedFocused = focused;
+    embedHint.classList.toggle('visible', focused);
+  }
+
+  // Detect when focus goes to/from iframe
+  const onWindowBlur = () => {
+    if (presenting) setEmbedFocused(true);
+  };
+  const onWindowFocus = () => {
+    setEmbedFocused(false);
+  };
+  window.addEventListener('blur', onWindowBlur);
+  window.addEventListener('focus', onWindowFocus);
+
+  // Block pan/zoom/drag during presentation (but allow embed + mask interaction)
   const blockWheel = (ev: WheelEvent) => { ev.preventDefault(); ev.stopPropagation(); };
-  const blockMouse = (ev: MouseEvent) => { ev.preventDefault(); ev.stopPropagation(); };
+  const blockMouse = (ev: MouseEvent) => {
+    const target = ev.target as HTMLElement;
+    if (target.closest('.item-embed')) return;
+    if (target === mask || target.closest('.present-mask')) {
+      window.focus();
+      setEmbedFocused(false);
+    }
+    ev.preventDefault(); ev.stopPropagation();
+  };
   canvasEl.addEventListener('wheel', blockWheel, { capture: true, passive: false });
   canvasEl.addEventListener('mousedown', blockMouse, { capture: true });
 
@@ -990,15 +1190,20 @@ function startPresentation() {
     setViewport(vp);
     updateZoomLabel(zoom);
 
-    // Position the cutout mask over the current frame (in screen coords)
-    const screenX = frame.position.x * zoom + vp.x;
-    const screenY = frame.position.y * zoom + vp.y;
+    // Position the cutout mask over the current frame (in viewport coords)
+    const screenX = frame.position.x * zoom + vp.x + rect.left;
+    const screenY = frame.position.y * zoom + vp.y + rect.top;
     const screenW = frame.size.w * zoom;
     const screenH = frame.size.h * zoom;
     mask.style.setProperty('--fx', `${screenX}px`);
     mask.style.setProperty('--fy', `${screenY}px`);
     mask.style.setProperty('--fw', `${screenW}px`);
     mask.style.setProperty('--fh', `${screenH}px`);
+
+    // Enable pointer-events on all embed iframes during presentation
+    for (const embedIframe of layer.querySelectorAll('.embed-iframe') as NodeListOf<HTMLElement>) {
+      embedIframe.style.pointerEvents = 'auto';
+    }
 
     // Update HUD
     const name = frame.content || 'Frame';
@@ -1011,6 +1216,9 @@ function startPresentation() {
     presenting = false;
     overlay.remove();
     mask.remove();
+    embedHint.remove();
+    window.removeEventListener('blur', onWindowBlur);
+    window.removeEventListener('focus', onWindowFocus);
     canvasEl.removeEventListener('wheel', blockWheel, { capture: true } as EventListenerOptions);
     canvasEl.removeEventListener('mousedown', blockMouse, { capture: true } as EventListenerOptions);
     sidebar?.classList.remove('present-hidden');
@@ -1020,12 +1228,18 @@ function startPresentation() {
     minimap?.classList.remove('present-hidden');
     document.removeEventListener('keydown', onKey, true);
 
+    // Restore embed iframe pointer-events to default (none, since nothing is selected)
+    for (const iframe of layer.querySelectorAll('.embed-iframe') as NodeListOf<HTMLElement>) {
+      iframe.style.pointerEvents = 'none';
+    }
+
     // Restore viewport
     setViewport(savedVp);
     updateZoomLabel(savedVp.zoom);
   }
 
   function onKey(e: KeyboardEvent) {
+    if (embedFullscreenOverlay) return;
     // Block ALL keys except navigation and exit
     e.preventDefault();
     e.stopPropagation();
@@ -1593,9 +1807,9 @@ async function exportFramesAsPdf() {
 
 async function resolveImagesForExport(board: Board): Promise<void> {
   for (const item of board.items) {
-    if (item.type === 'image' && isIdbRef(item.content)) {
-      const dataUrl = await getImage(item.content);
-      if (dataUrl) item.content = dataUrl;
+    if ((item.type === 'image' || item.type === 'embed') && isIdbRef(item.content)) {
+      const data = await getImage(item.content);
+      if (data) item.content = data;
     }
   }
 }
@@ -1702,7 +1916,7 @@ function showImportPreview(board: Board, subBoards: Board[], onConfirm: () => vo
 
   const typeLabels: Record<string, string> = {
     image: 'Imagens', text: 'Textos', note: 'Notas', color: 'Cores',
-    link: 'Links', frame: 'Frames', board: 'Sub-boards'
+    link: 'Links', frame: 'Frames', board: 'Sub-boards', embed: 'Embeds'
   };
 
   let infoHtml = `<div class="import-preview-name">${boardName}</div>`;
@@ -1827,6 +2041,12 @@ const { canvas: canvasEl, layer, getViewport, getCanvasRect, setZoom, resetView,
       const itemEl = layer.querySelector(`[data-item-id="${selectionToolbarItemId}"]`) as HTMLElement | null;
       if (itemEl) positionToolbar(selectionToolbar, itemEl);
     }
+    // Broadcast viewport to other users (fast broadcast + throttled presence)
+    if (currentProfile) {
+      const rect = getCanvasRect();
+      broadcastViewport(viewport, rect.width, rect.height);
+      throttledPresenceUpdate(currentProfile, viewport);
+    }
   }
 );
 
@@ -1854,6 +2074,7 @@ renderSidebar(boardView, {
   onDraw: () => showDrawMenu(),
   onAddFrame: () => showFrameMenu(),
   onAddBoard: addSubBoardAtCenter,
+  onAddEmbed: addEmbedFromFile,
   onConnect: () => startConnectMode(),
   onSelect: () => activateSelectTool(),
 });
@@ -1888,6 +2109,8 @@ renderToolbar(boardView, getActiveBoard().name, {
   onPresent: startPresentation,
   onSlideOrder: openSlideOrderEditor,
   onToggleTheme: toggleTheme,
+  onHistory: () => toggleHistoryPanel(),
+  onShare: () => toggleSharePanel(),
 });
 
 // --- Back navigation bar ---
@@ -1961,12 +2184,24 @@ _onViewportChange = updateMinimap;
 // --- View Routing ---
 
 function showHomeScreen() {
+  if (isPublicView) return;
   // Save current board's viewport
   if (state.activeBoardId) {
     const board = state.boards.find(b => b.id === state.activeBoardId);
     if (board) board.viewport = getViewport();
     save();
   }
+  leaveBoard();
+  try { closeCommentPopover(); } catch {}
+  try { unsubscribeComments(); } catch {}
+  stopAutoSnapshot();
+  closeHistoryPanel();
+  closeSharePanel();
+  removeAllRemoteCursors();
+  removeFollowBanner();
+  currentBoardRole = 'owner';
+  const badge = document.getElementById('readonly-badge');
+  if (badge) badge.remove();
   currentView = 'home';
   boardNavHistory.length = 0; // clear navigation history
   updateBackBar();
@@ -2012,18 +2247,318 @@ function showBoardView(boardId: string, skipHistory = false) {
 
   // Update back navigation bar
   updateBackBar();
+
+  // Join presence channel and fetch role
+  if (currentProfile) {
+    joinBoard(boardId, currentProfile, board.viewport);
+    getBoardRole(boardId, currentProfile.id).then(role => {
+      currentBoardRole = role;
+      applyRoleRestrictions();
+    });
+    // Load comment counts and subscribe to realtime
+    loadCommentCounts(boardId).then(() => rerender());
+    setupCommentSync(boardId);
+  }
+
+  // Start auto-snapshot for version history
+  startAutoSnapshot(() => {
+    const b = state.boards.find(x => x.id === boardId);
+    return b || null;
+  });
+}
+
+function applyRoleRestrictions() {
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar) {
+    sidebar.style.display = isReadOnly() ? 'none' : '';
+  }
+  const toolbar = document.getElementById('toolbar');
+  if (toolbar) {
+    const editBtns = toolbar.querySelectorAll('#btn-undo, #btn-redo');
+    editBtns.forEach(btn => (btn as HTMLElement).style.display = isReadOnly() ? 'none' : '');
+    const exportWrap = toolbar.querySelector('.export-dropdown-wrap');
+    if (exportWrap) (exportWrap as HTMLElement).style.display = isReadOnly() ? 'none' : '';
+    const importBtn = toolbar.querySelector('[title="Ctrl+O"]');
+    if (importBtn) (importBtn as HTMLElement).style.display = isReadOnly() ? 'none' : '';
+  }
+  // Show read-only indicator
+  let badge = document.getElementById('readonly-badge');
+  if (isReadOnly() && !badge) {
+    badge = document.createElement('div');
+    badge.id = 'readonly-badge';
+    badge.textContent = 'Somente leitura';
+    document.body.append(badge);
+  } else if (!isReadOnly() && badge) {
+    badge.remove();
+  }
+}
+
+// --- Favorites (localStorage) ---
+
+const FAVORITES_KEY = 'moodboard-favorites';
+
+function loadFavorites(): Set<string> {
+  try {
+    const raw = localStorage.getItem(FAVORITES_KEY);
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch { return new Set(); }
+}
+
+function saveFavorites(favs: Set<string>): void {
+  localStorage.setItem(FAVORITES_KEY, JSON.stringify([...favs]));
+}
+
+const favorites = loadFavorites();
+
+function toggleFavorite(boardId: string): void {
+  if (favorites.has(boardId)) {
+    favorites.delete(boardId);
+  } else {
+    favorites.add(boardId);
+  }
+  saveFavorites(favorites);
+  refreshHome();
+}
+
+// --- Version History Panel ---
+
+let historyPanel: HTMLElement | null = null;
+
+function formatSnapshotDate(ts: number): string {
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function closeHistoryPanel(): void {
+  if (historyPanel) {
+    historyPanel.remove();
+    historyPanel = null;
+  }
+}
+
+async function renderHistoryList(list: HTMLElement, boardId: string): Promise<void> {
+  const snapshots = await getSnapshots(boardId);
+  list.innerHTML = '';
+
+  if (snapshots.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'history-empty';
+    empty.textContent = 'Nenhuma versão salva ainda';
+    list.appendChild(empty);
+    return;
+  }
+
+  for (const snap of snapshots) {
+    const row = document.createElement('div');
+    row.className = 'history-item';
+
+    const info = document.createElement('div');
+    info.className = 'history-item-info';
+
+    const label = document.createElement('div');
+    label.className = 'history-item-label';
+    label.textContent = snap.label || 'Snapshot';
+
+    const meta = document.createElement('div');
+    meta.className = 'history-item-meta';
+    meta.textContent = `${formatSnapshotDate(snap.createdAt)} · ${snap.itemCount} itens`;
+
+    info.append(label, meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'history-item-actions';
+
+    const restoreBtn = document.createElement('button');
+    restoreBtn.className = 'history-btn-restore';
+    restoreBtn.textContent = 'Restaurar';
+    restoreBtn.title = 'Restaurar esta versão';
+    restoreBtn.addEventListener('click', () => {
+      if (!confirm('Restaurar esta versão? As alterações atuais serão substituídas.')) return;
+      const restoredBoard = restoreBoardFromSnapshot(snap);
+      const board = getActiveBoard();
+      board.items = restoredBoard.items;
+      board.connections = restoredBoard.connections || [];
+      snapshot();
+      rerender();
+      save();
+      closeHistoryPanel();
+    });
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'history-btn-delete';
+    deleteBtn.textContent = '×';
+    deleteBtn.title = 'Excluir versão';
+    deleteBtn.addEventListener('click', async () => {
+      await deleteSnapshot(snap.id);
+      await renderHistoryList(list, boardId);
+    });
+
+    actions.append(restoreBtn, deleteBtn);
+    row.append(info, actions);
+    list.appendChild(row);
+  }
+}
+
+async function toggleHistoryPanel(): Promise<void> {
+  if (historyPanel) {
+    closeHistoryPanel();
+    return;
+  }
+
+  const boardId = state.activeBoardId;
+  if (!boardId) return;
+
+  historyPanel = document.createElement('div');
+  historyPanel.className = 'history-panel';
+
+  const header = document.createElement('div');
+  header.className = 'history-panel-header';
+
+  const title = document.createElement('span');
+  title.textContent = 'Histórico de versões';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'history-panel-close';
+  closeBtn.textContent = '×';
+  closeBtn.addEventListener('click', closeHistoryPanel);
+
+  header.append(title, closeBtn);
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'history-save-btn';
+  saveBtn.textContent = '+ Salvar versão atual';
+  saveBtn.addEventListener('click', async () => {
+    const board = getActiveBoard();
+    await saveSnapshot(board, 'Manual');
+    await renderHistoryList(list, boardId);
+  });
+
+  const list = document.createElement('div');
+  list.className = 'history-list';
+
+  historyPanel.append(header, saveBtn, list);
+  document.body.appendChild(historyPanel);
+
+  await renderHistoryList(list, boardId);
+}
+
+// --- Share Link Panel ---
+
+let sharePanel: HTMLElement | null = null;
+
+function closeSharePanel(): void {
+  if (sharePanel) {
+    sharePanel.remove();
+    sharePanel = null;
+  }
+}
+
+async function toggleSharePanel(): Promise<void> {
+  if (sharePanel) {
+    closeSharePanel();
+    return;
+  }
+
+  const boardId = state.activeBoardId;
+  if (!boardId || !currentProfile) return;
+
+  sharePanel = document.createElement('div');
+  sharePanel.className = 'share-panel';
+
+  const header = document.createElement('div');
+  header.className = 'share-panel-header';
+  const title = document.createElement('span');
+  title.textContent = 'Compartilhar board';
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'history-panel-close';
+  closeBtn.textContent = '×';
+  closeBtn.addEventListener('click', closeSharePanel);
+  header.append(title, closeBtn);
+
+  const content = document.createElement('div');
+  content.className = 'share-panel-content';
+  content.textContent = 'Carregando…';
+
+  sharePanel.append(header, content);
+  document.body.appendChild(sharePanel);
+
+  // Fetch current public_token
+  const { data: board } = await supabase
+    .from('boards')
+    .select('public_token')
+    .eq('id', boardId)
+    .single();
+
+  const currentToken = board?.public_token as string | null;
+
+  function renderShareContent(token: string | null) {
+    content.innerHTML = '';
+    const desc = document.createElement('p');
+    desc.className = 'share-desc';
+
+    if (token) {
+      desc.textContent = 'Link público ativo. Qualquer pessoa com o link pode visualizar este board (somente leitura).';
+      content.appendChild(desc);
+
+      const linkBox = document.createElement('div');
+      linkBox.className = 'share-link-box';
+      const url = `${window.location.origin}${window.location.pathname}?view=${token}`;
+      const linkInput = document.createElement('input');
+      linkInput.type = 'text';
+      linkInput.readOnly = true;
+      linkInput.value = url;
+      linkInput.className = 'share-link-input';
+
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'share-copy-btn';
+      copyBtn.textContent = 'Copiar';
+      copyBtn.addEventListener('click', () => {
+        navigator.clipboard.writeText(url);
+        copyBtn.textContent = 'Copiado!';
+        setTimeout(() => { copyBtn.textContent = 'Copiar'; }, 2000);
+      });
+      linkBox.append(linkInput, copyBtn);
+      content.appendChild(linkBox);
+
+      const disableBtn = document.createElement('button');
+      disableBtn.className = 'share-disable-btn';
+      disableBtn.textContent = 'Desativar link público';
+      disableBtn.addEventListener('click', async () => {
+        await supabase.from('boards').update({ public_token: null }).eq('id', boardId);
+        renderShareContent(null);
+      });
+      content.appendChild(disableBtn);
+    } else {
+      desc.textContent = 'Gere um link público para compartilhar este board em modo somente leitura. Não é necessário login para visualizar.';
+      content.appendChild(desc);
+
+      const enableBtn = document.createElement('button');
+      enableBtn.className = 'share-enable-btn';
+      enableBtn.textContent = 'Gerar link público';
+      enableBtn.addEventListener('click', async () => {
+        const newToken = crypto.randomUUID();
+        await supabase.from('boards').update({ public_token: newToken }).eq('id', boardId);
+        renderShareContent(newToken);
+      });
+      content.appendChild(enableBtn);
+    }
+  }
+
+  renderShareContent(currentToken);
 }
 
 function refreshHome() {
   renderHome(homeScreen, state.boards, {
     onOpenBoard: (id) => showBoardView(id),
-    onNewBoard: () => {
+    onNewBoard: async () => {
       const board = createBoard(`Board ${state.boards.length + 1}`);
       state.boards.push(board);
       save();
+      if (currentProfile) await saveBoardToSupabase(board, currentProfile.id);
       showBoardView(board.id);
     },
-    onDeleteBoard: (id) => {
+    onDeleteBoard: async (id) => {
       const idx = state.boards.findIndex(b => b.id === id);
       if (idx < 0) return;
       state.boards.splice(idx, 1);
@@ -2031,6 +2566,8 @@ function refreshHome() {
         state.activeBoardId = state.boards[0]?.id || null;
       }
       save();
+      const { deleteBoardFromSupabase } = await import('./boardStore');
+      await deleteBoardFromSupabase(id);
       refreshHome();
     },
     onArchiveBoard: (id) => {
@@ -2042,6 +2579,46 @@ function refreshHome() {
         refreshHome();
       }
     },
+    onDuplicateBoard: async (id) => {
+      const original = state.boards.find(b => b.id === id);
+      if (!original) return;
+      const now = Date.now();
+      const newId = crypto.randomUUID();
+      const idMap = new Map<string, string>();
+      const newItems = original.items.map(item => {
+        const newItemId = generateId();
+        idMap.set(item.id, newItemId);
+        return { ...item, id: newItemId, createdAt: now };
+      });
+      // Remap groupIds so groups stay internal to the copy
+      for (const item of newItems) {
+        if (item.groupId && idMap.has(item.groupId)) {
+          item.groupId = idMap.get(item.groupId);
+        }
+      }
+      const newConns = (original.connections || []).map(c => ({
+        ...c,
+        id: generateId(),
+        fromId: idMap.get(c.fromId) || c.fromId,
+        toId: idMap.get(c.toId) || c.toId,
+      }));
+      const copy: Board = {
+        id: newId,
+        name: `Cópia de ${original.name}`,
+        description: original.description,
+        items: newItems,
+        connections: newConns,
+        viewport: { ...original.viewport },
+        createdAt: now,
+        updatedAt: now,
+      };
+      state.boards.unshift(copy);
+      save();
+      if (currentProfile) await saveBoardToSupabase(copy, currentProfile.id);
+      refreshHome();
+    },
+    onToggleFavorite: (id) => toggleFavorite(id),
+    isFavorite: (id) => favorites.has(id),
     onRenameBoard: (id, name) => {
       const board = state.boards.find(b => b.id === id);
       if (board) {
@@ -2059,6 +2636,233 @@ function refreshHome() {
       }
     },
     onToggleTheme: toggleTheme,
+    onAdmin: () => showAdminView(),
+    onLogout: async () => {
+      await signOut();
+      leaveBoard();
+      currentProfile = null;
+      showLoginScreen();
+    },
+    isAdmin: currentProfile?.is_admin ?? false,
+    userName: currentProfile?.display_name,
+    userColor: currentProfile?.color,
+    userAvatar: currentProfile?.avatar_url,
+  });
+}
+
+// --- Auth, Admin & Presence ---
+
+const loginScreen = document.createElement('div');
+loginScreen.id = 'login-screen';
+loginScreen.style.display = 'none';
+app.append(loginScreen);
+
+function showLoginScreen() {
+  loginScreen.style.display = 'block';
+  renderLogin(loginScreen, async () => {
+    const auth = getAuth();
+    currentProfile = auth.profile;
+    loginScreen.style.display = 'none';
+    await loadRemoteBoards();
+    refreshHome();
+    setupPresence();
+    setupBoardSync();
+  });
+}
+
+async function loadRemoteBoards() {
+  if (!currentProfile) return;
+  try {
+    const remoteBoards = await loadBoardsFromSupabase();
+    if (remoteBoards.length > 0) {
+      state.boards = remoteBoards;
+      state.activeBoardId = remoteBoards[0].id;
+      saveState(state);
+      rerender();
+      // Push locally-available idb content to Supabase for other users
+      resyncIdbContent(remoteBoards, currentProfile!.id);
+    } else if (state.boards.length > 0) {
+      await migrateLocalBoards(state, currentProfile.id);
+    }
+  } catch {
+    // Fallback to localStorage
+  }
+}
+
+function showAdminView() {
+  const adminContainer = document.createElement('div');
+  adminContainer.id = 'admin-container';
+  app.append(adminContainer);
+  renderAdmin(adminContainer, {
+    onClose: () => adminContainer.remove(),
+    getBoards: () => state.boards,
+  });
+}
+
+// --- Presence / Follow ---
+
+let followBanner: HTMLElement | null = null;
+
+function removeFollowBanner() {
+  if (followBanner) {
+    followBanner.remove();
+    followBanner = null;
+  }
+  stopFollowing();
+}
+
+function updatePresenceAvatars(users: PresenceState[]) {
+  const container = document.getElementById('presence-avatars');
+  if (!container) return;
+  container.innerHTML = '';
+
+  for (const user of users) {
+    const av = document.createElement('div');
+    av.className = 'presence-avatar' + (getFollowingUserId() === user.id ? ' following' : '');
+    av.style.background = user.profile.color;
+    if (user.profile.avatar_url) {
+      av.style.backgroundImage = `url(${user.profile.avatar_url})`;
+      av.textContent = '';
+    } else {
+      av.textContent = (user.profile.display_name || 'U')[0].toUpperCase();
+    }
+
+    const tooltip = document.createElement('div');
+    tooltip.className = 'presence-avatar-tooltip';
+    tooltip.textContent = user.profile.display_name;
+    av.append(tooltip);
+
+    av.addEventListener('click', () => {
+      if (getFollowingUserId() === user.id) {
+        removeFollowBanner();
+        updatePresenceAvatars(users);
+        return;
+      }
+      removeFollowBanner();
+      startFollowing(user.id, (target: FollowTarget) => {
+        const rect = getCanvasRect();
+        const vp = {
+          x: rect.width / 2 - target.centerX * target.zoom,
+          y: rect.height / 2 - target.centerY * target.zoom,
+          zoom: target.zoom,
+        };
+        setViewport(vp);
+        updateZoomLabel(vp.zoom);
+      });
+      followBanner = document.createElement('div');
+      followBanner.className = 'follow-banner';
+      followBanner.innerHTML = `Seguindo <strong>${user.profile.display_name}</strong>`;
+      const stopBtn = document.createElement('button');
+      stopBtn.textContent = 'Parar';
+      stopBtn.addEventListener('click', () => {
+        removeFollowBanner();
+        updatePresenceAvatars(users);
+      });
+      followBanner.append(stopBtn);
+      document.body.append(followBanner);
+      updatePresenceAvatars(users);
+    });
+
+    container.append(av);
+  }
+}
+
+function setupPresence() {
+  onPresenceChange((users) => {
+    updatePresenceAvatars(users);
+    checkFollowUpdate();
+  });
+}
+
+// --- Remote Cursors ---
+
+const remoteCursors = new Map<string, { el: HTMLElement; timer: ReturnType<typeof setTimeout> }>();
+
+function getOrCreateCursorEl(userId: string): HTMLElement {
+  const existing = remoteCursors.get(userId);
+  if (existing) {
+    clearTimeout(existing.timer);
+    return existing.el;
+  }
+  const users = getOnlineUsers();
+  const user = users.find(u => u.id === userId);
+  const color = user?.profile.color || '#888';
+  const name = user?.profile.display_name || '?';
+
+  const el = document.createElement('div');
+  el.className = 'remote-cursor';
+  el.innerHTML = `<svg width="16" height="20" viewBox="0 0 16 20" fill="${color}" stroke="#fff" stroke-width="1"><path d="M0 0 L16 12 L8 12 L6 20 Z"/></svg><span class="remote-cursor-label" style="background:${color}">${name}</span>`;
+  document.getElementById('board-view')!.appendChild(el);
+  remoteCursors.set(userId, { el, timer: setTimeout(() => {}, 0) });
+  return el;
+}
+
+function updateRemoteCursor(userId: string, boardX: number, boardY: number): void {
+  if (currentView !== 'board') return;
+  const el = getOrCreateCursorEl(userId);
+  const vp = getViewport();
+  const rect = getCanvasRect();
+  const sx = boardX * vp.zoom + vp.x + rect.left;
+  const sy = boardY * vp.zoom + vp.y + rect.top;
+  el.style.left = sx + 'px';
+  el.style.top = sy + 'px';
+  el.style.display = '';
+
+  const entry = remoteCursors.get(userId)!;
+  clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => { el.style.display = 'none'; }, 5000);
+}
+
+function removeAllRemoteCursors(): void {
+  for (const [, { el, timer }] of remoteCursors) {
+    clearTimeout(timer);
+    el.remove();
+  }
+  remoteCursors.clear();
+}
+
+onRemoteCursor((userId, x, y) => {
+  updateRemoteCursor(userId, x, y);
+});
+
+function setupCommentSync(boardId: string) {
+  unsubscribeComments();
+  subscribeToComments(boardId, (type, itemId, comment) => {
+    // Update badge on items
+    if (currentView === 'board' && state.activeBoardId === boardId) {
+      rerender();
+    }
+    // Forward to open popover if it has a handler
+    const handler = (window as any).__commentPopoverHandler;
+    if (handler) handler(type, itemId, comment);
+  });
+}
+
+function setupBoardSync() {
+  subscribeToBoardChanges((boardId, updatedBoard) => {
+    const idx = state.boards.findIndex(b => b.id === boardId);
+    if (idx < 0) return;
+
+    // Merge: keep local viewport, update items/connections/name
+    const local = state.boards[idx];
+    local.items = updatedBoard.items;
+    local.connections = updatedBoard.connections;
+    local.name = updatedBoard.name;
+    local.updatedAt = updatedBoard.updatedAt;
+
+    saveState(state);
+
+    // If this board is currently open, re-render
+    if (currentView === 'board' && state.activeBoardId === boardId) {
+      rerender();
+      const nameEl = document.getElementById('board-name');
+      if (nameEl) nameEl.textContent = local.name;
+    }
+
+    // If on home screen, refresh board list
+    if (currentView === 'home') {
+      refreshHome();
+    }
   });
 }
 
@@ -2069,11 +2873,111 @@ updateZoomLabel(getActiveBoard().viewport.zoom);
 rerender();
 showHomeScreen();
 
+// --- Public View Mode ---
+
+async function enterPublicView(token: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('boards')
+    .select('id, name, data')
+    .eq('public_token', token)
+    .single();
+
+  if (error) {
+    console.error('[public-view] query error:', error.message, error.code);
+    return false;
+  }
+  if (!data) return false;
+
+  const board = (data as any).data as Board;
+  board.id = (data as any).id;
+  board.name = (data as any).name;
+
+  // Compress inline images to IndexedDB for rendering
+  const { compressToIdb } = await import('./boardStore');
+  if (board.items) await compressToIdb(board.items);
+
+  state.boards = [board];
+  state.activeBoardId = board.id;
+  currentBoardRole = 'viewer';
+  isPublicView = true;
+  currentView = 'board';
+
+  loginScreen.style.display = 'none';
+  homeScreen.classList.add('hidden');
+  clearSelection();
+  setViewport(board.viewport);
+  updateZoomLabel(board.viewport.zoom);
+  snapshot();
+  rerender();
+
+  // Update toolbar for public view
+  const nameEl = document.getElementById('board-name');
+  if (nameEl) nameEl.textContent = board.name;
+  applyRoleRestrictions();
+
+  // Hide toolbar elements for public viewer
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar) sidebar.style.display = 'none';
+  const toolbar = document.getElementById('toolbar');
+  if (toolbar) {
+    const hideIds = ['btn-home', 'btn-history', 'btn-share', 'btn-undo', 'btn-redo'];
+    hideIds.forEach(id => {
+      const el = toolbar.querySelector(`#${id}`);
+      if (el) (el as HTMLElement).style.display = 'none';
+    });
+    const exportWrap = toolbar.querySelector('.export-dropdown-wrap');
+    if (exportWrap) (exportWrap as HTMLElement).style.display = 'none';
+    const importBtn = toolbar.querySelector('[title="Ctrl+O"]');
+    if (importBtn) (importBtn as HTMLElement).style.display = 'none';
+    const presenceAvatars = toolbar.querySelector('#presence-avatars');
+    if (presenceAvatars) (presenceAvatars as HTMLElement).style.display = 'none';
+  }
+
+  return true;
+}
+
+(async () => {
+  // Check for public view token in URL
+  const params = new URLSearchParams(window.location.search);
+  const viewToken = params.get('view');
+  if (viewToken) {
+    try {
+      const ok = await enterPublicView(viewToken);
+      if (ok) return;
+    } catch (e) {
+      console.warn('[public-view] failed:', e);
+    }
+  }
+
+  try {
+    const auth = await initAuth();
+    if (auth.session && auth.profile) {
+      currentProfile = auth.profile;
+      loginScreen.style.display = 'none';
+      await loadRemoteBoards();
+      refreshHome();
+      setupPresence();
+      setupBoardSync();
+    } else {
+      showLoginScreen();
+    }
+  } catch (e) {
+    console.warn('[init] Supabase unavailable, running offline:', e);
+    showLoginScreen();
+  }
+})();
+
 // --- Item interactions via event delegation on layer ---
 
 layer.addEventListener('mousedown', (e: MouseEvent) => {
   if (e.button !== 0) return;
   if (isSpaceHeld()) return;
+
+  // Stop following when user clicks on canvas
+  if (getFollowingUserId()) {
+    removeFollowBanner();
+  }
+
   // In free-draw mode, let the canvas handler deal with it
   if (freeDrawMode) return;
 
@@ -2086,6 +2990,16 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
     e.stopPropagation();
     const parentItemEl = linkEl.closest('[data-item-id]') as HTMLElement | null;
     if (parentItemEl) showLinkPreview(linkEl, parentItemEl);
+    return;
+  }
+
+  // Comment badge click
+  const commentBadge = target.closest('.comment-badge') as HTMLElement | null;
+  if (commentBadge) {
+    e.stopPropagation();
+    const itemEl = commentBadge.closest('[data-item-id]') as HTMLElement;
+    const id = itemEl?.dataset.itemId;
+    if (id && itemEl) showCommentPopover(itemEl, id);
     return;
   }
 
@@ -2122,6 +3036,13 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
   const id = itemEl.dataset.itemId!;
   const item = findItem(id);
   if (!item) return;
+
+  // Viewers can only select and view, not drag/resize/edit
+  if (isReadOnly()) {
+    selectOnly(id);
+    syncSelection();
+    return;
+  }
 
   // Block interaction with dimmed items (tag filter active)
   if (activeTagFilters.size > 0) {
@@ -2176,8 +3097,20 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
       origX: item.position.x, origY: item.position.y,
       origW: item.size.w, origH: item.size.h,
     };
+    for (const iframe of layer.querySelectorAll('.embed-iframe') as NodeListOf<HTMLElement>) {
+      iframe.style.pointerEvents = 'none';
+    }
     syncSelection();
     return;
+  }
+
+  // Embed: only the handle bar drags; clicking the iframe area does nothing (interaction goes to iframe)
+  if (item.type === 'embed') {
+    const embedHandle = (target as HTMLElement).closest('.embed-handle');
+    if (!embedHandle) {
+      if (!selectedIds.has(id)) { selectOnly(id); syncSelection(); }
+      return;
+    }
   }
 
   // Frame: only title bar drags the frame; clicking body starts lasso selection
@@ -2252,6 +3185,11 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
 
   dragging = { origins, anchorX: boardPos.x, anchorY: boardPos.y };
 
+  // Disable iframe pointer-events during drag so they don't steal mousemove/mouseup
+  for (const iframe of layer.querySelectorAll('.embed-iframe') as NodeListOf<HTMLElement>) {
+    iframe.style.pointerEvents = 'none';
+  }
+
   if (selectionChanged) syncSelection();
 });
 
@@ -2266,6 +3204,16 @@ layer.addEventListener('contextmenu', (e: MouseEvent) => {
   const id = itemEl.dataset.itemId!;
   const item = findItem(id);
   if (!item) return;
+
+  // Viewers only get comment access via context menu
+  if (isReadOnly()) {
+    const count = getCommentCount(id);
+    showContextMenu(e.clientX, e.clientY, [{
+      label: count > 0 ? `Comentários (${count})` : 'Comentários',
+      action: () => showCommentPopover(itemEl, id)
+    }]);
+    return;
+  }
 
   if (!selectedIds.has(id)) {
     selectOnly(id);
@@ -2438,6 +3386,39 @@ layer.addEventListener('contextmenu', (e: MouseEvent) => {
     });
   }
 
+  if (item.type === 'embed') {
+    menuItems.push({
+      label: 'Renomear',
+      action: () => {
+        const name = prompt('Título do embed:', item.sourceUrl || 'Embed HTML');
+        if (name !== null) {
+          item.sourceUrl = name.trim() || 'Embed HTML';
+          commit();
+          rerender();
+        }
+      }
+    });
+    menuItems.push({
+      label: 'Substituir HTML',
+      action: () => {
+        const inp = document.createElement('input');
+        inp.type = 'file';
+        inp.accept = '.html,.htm';
+        inp.addEventListener('change', async () => {
+          const file = inp.files?.[0];
+          if (!file) return;
+          const html = await file.text();
+          const ref = await saveImage(html);
+          item.content = ref;
+          item.sourceUrl = file.name.replace(/\.\w+$/, '');
+          commit();
+          rerender();
+        });
+        inp.click();
+      }
+    });
+  }
+
   if (item.type === 'board') {
     const subId = item.content;
     const sub = state.boards.find(b => b.id === subId);
@@ -2592,6 +3573,14 @@ layer.addEventListener('contextmenu', (e: MouseEvent) => {
     action: () => openTagEditor()
   });
 
+  {
+    const count = getCommentCount(id);
+    menuItems.push({
+      label: count > 0 ? `Comentários (${count})` : 'Comentários',
+      action: () => showCommentPopover(itemEl, id)
+    });
+  }
+
   menuItems.push({
     label: 'Excluir',
     action: () => {
@@ -2720,6 +3709,14 @@ canvas.addEventListener('mousedown', (e: MouseEvent) => {
 // --- Connection preview on mousemove ---
 
 layer.addEventListener('mousemove', (e: MouseEvent) => {
+  // Broadcast cursor position to other users
+  if (currentProfile) {
+    const vp = getViewport();
+    const rect = getCanvasRect();
+    const bp = screenToBoard(e.clientX - rect.left, e.clientY - rect.top, vp);
+    broadcastCursorPos(bp.x, bp.y);
+  }
+
   if (isConnectMode() && connectingFromId) {
     const fromItem = findItem(connectingFromId);
     if (fromItem) {
@@ -2966,11 +3963,21 @@ window.addEventListener('mouseup', (e: MouseEvent) => {
   if (dragging) {
     dragging = null;
     clearGuides();
+    // Restore iframe pointer-events based on selection
+    for (const el of layer.querySelectorAll('.item-embed') as NodeListOf<HTMLElement>) {
+      const iframe = el.querySelector('.embed-iframe') as HTMLElement | null;
+      if (iframe) iframe.style.pointerEvents = el.classList.contains('selected') ? 'auto' : 'none';
+    }
     commit();
   }
 
   if (resizing) {
     resizing = null;
+    // Restore iframe pointer-events after resize too
+    for (const el of layer.querySelectorAll('.item-embed') as NodeListOf<HTMLElement>) {
+      const iframe = el.querySelector('.embed-iframe') as HTMLElement | null;
+      if (iframe) iframe.style.pointerEvents = el.classList.contains('selected') ? 'auto' : 'none';
+    }
     commit();
   }
 
@@ -3807,6 +4814,7 @@ layer.addEventListener('dblclick', (e: MouseEvent) => {
 });
 
 layer.addEventListener('dblclick', (e: MouseEvent) => {
+  if (isReadOnly()) return;
   if (editingId) return;
   const itemEl = (e.target as HTMLElement).closest('[data-item-id]') as HTMLElement | null;
   if (!itemEl) return;
@@ -3842,6 +4850,7 @@ layer.addEventListener('dblclick', (e: MouseEvent) => {
     }
     return;
   }
+  if (item.type === 'embed') return;
   startEditing(id, itemEl);
 });
 
@@ -3859,11 +4868,14 @@ canvas.addEventListener('dragleave', () => {
 canvas.addEventListener('drop', (e: DragEvent) => {
   e.preventDefault();
   canvas.classList.remove('drop-active');
+  if (isReadOnly()) return;
   const files = e.dataTransfer?.files;
   if (!files) return;
   for (const file of Array.from(files)) {
     if (file.type.startsWith('image/')) {
       addImageFromFile(file, e.clientX, e.clientY);
+    } else if (file.name.endsWith('.html') || file.name.endsWith('.htm')) {
+      addEmbedFromFile(file, e.clientX, e.clientY);
     }
   }
 });
@@ -3872,6 +4884,7 @@ canvas.addEventListener('drop', (e: DragEvent) => {
 
 document.addEventListener('paste', (e: ClipboardEvent) => {
   if (currentView !== 'board') return;
+  if (isReadOnly()) return;
   if (editingId) return;
   const clipItems = e.clipboardData?.items;
 
@@ -4052,6 +5065,239 @@ function openTagEditor() {
     commit();
     rerender();
   }
+}
+
+// --- Comment popover ---
+
+let _commentPopoverCleanup: (() => void) | null = null;
+
+function closeCommentPopover() {
+  if (_commentPopoverCleanup) {
+    _commentPopoverCleanup();
+    _commentPopoverCleanup = null;
+  }
+}
+
+function timeAgo(dateStr: string): string {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'agora';
+  if (mins < 60) return `${mins}min`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `${days}d`;
+}
+
+function renderCommentEl(c: CommentWithAuthor, canDelete: boolean, onDelete: () => void): HTMLElement {
+  const item = document.createElement('div');
+  item.className = 'comment-item';
+  item.dataset.commentId = c.id;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'comment-avatar';
+  avatar.style.background = c.author.color || '#888';
+  avatar.textContent = (c.author.display_name || c.author.email || '?')[0].toUpperCase();
+  if (c.author.avatar_url) {
+    const img = document.createElement('img');
+    img.src = c.author.avatar_url;
+    img.style.width = '100%';
+    img.style.height = '100%';
+    img.style.borderRadius = '50%';
+    avatar.textContent = '';
+    avatar.appendChild(img);
+  }
+
+  const body = document.createElement('div');
+  body.className = 'comment-body';
+
+  const meta = document.createElement('div');
+  meta.className = 'comment-meta';
+  const authorEl = document.createElement('span');
+  authorEl.className = 'comment-author';
+  authorEl.textContent = c.author.display_name || c.author.email;
+  const timeEl = document.createElement('span');
+  timeEl.className = 'comment-time';
+  timeEl.textContent = timeAgo(c.created_at);
+  meta.append(authorEl, timeEl);
+
+  const text = document.createElement('div');
+  text.className = 'comment-text';
+  text.textContent = c.content;
+
+  body.append(meta, text);
+  item.append(avatar, body);
+
+  if (canDelete) {
+    const del = document.createElement('button');
+    del.className = 'comment-delete';
+    del.title = 'Excluir';
+    del.innerHTML = '×';
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      onDelete();
+    });
+    item.appendChild(del);
+  }
+
+  return item;
+}
+
+async function showCommentPopover(itemEl: HTMLElement, itemId: string) {
+  closeCommentPopover();
+  closeLinkPreview();
+  closeContextMenu();
+
+  const boardId = state.activeBoardId;
+  if (!boardId || !currentProfile) return;
+
+  const popup = document.createElement('div');
+  popup.className = 'comment-popover';
+
+  // Header
+  const header = document.createElement('div');
+  header.className = 'comment-popover-header';
+  const title = document.createElement('span');
+  title.textContent = 'Comentários';
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'comment-popover-close';
+  closeBtn.innerHTML = '×';
+  closeBtn.addEventListener('click', () => closeCommentPopover());
+  header.append(title, closeBtn);
+
+  // Comment list
+  const list = document.createElement('div');
+  list.className = 'comment-list';
+
+  // Compose area
+  const compose = document.createElement('div');
+  compose.className = 'comment-compose';
+  const input = document.createElement('textarea');
+  input.className = 'comment-input';
+  input.placeholder = 'Escreva um comentário...';
+  input.rows = 1;
+  const sendBtn = document.createElement('button');
+  sendBtn.className = 'comment-send';
+  sendBtn.disabled = true;
+  sendBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4z"/></svg>';
+
+  input.addEventListener('input', () => {
+    sendBtn.disabled = !input.value.trim();
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 80) + 'px';
+  });
+
+  const doSend = async () => {
+    const text = input.value.trim();
+    if (!text || !currentProfile) return;
+    sendBtn.disabled = true;
+    input.value = '';
+    input.style.height = '';
+
+    const comment = await addComment(boardId, itemId, currentProfile.id, text);
+    if (comment) {
+      const canDel = comment.profile_id === currentProfile!.id || currentProfile!.is_admin;
+      list.appendChild(renderCommentEl(comment, canDel, async () => {
+        await deleteComment(comment.id, itemId);
+        list.querySelector(`[data-comment-id="${comment.id}"]`)?.remove();
+        updateBadge();
+      }));
+      list.scrollTop = list.scrollHeight;
+      updateBadge();
+    }
+  };
+
+  sendBtn.addEventListener('click', doSend);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      doSend();
+    }
+  });
+
+  compose.append(input, sendBtn);
+  popup.append(header, list, compose);
+  document.body.appendChild(popup);
+
+  // Position relative to item
+  const rect = itemEl.getBoundingClientRect();
+  popup.style.left = `${rect.right + 8}px`;
+  popup.style.top = `${rect.top}px`;
+
+  requestAnimationFrame(() => {
+    const popRect = popup.getBoundingClientRect();
+    if (popRect.right > window.innerWidth) {
+      popup.style.left = `${rect.left - popRect.width - 8}px`;
+    }
+    if (popRect.bottom > window.innerHeight) {
+      popup.style.top = `${Math.max(8, window.innerHeight - popRect.height - 8)}px`;
+    }
+  });
+
+  // Load existing comments
+  const comments = await loadComments(boardId, itemId);
+  for (const c of comments) {
+    const canDel = c.profile_id === currentProfile.id || currentProfile.is_admin;
+    list.appendChild(renderCommentEl(c, canDel, async () => {
+      await deleteComment(c.id, itemId);
+      list.querySelector(`[data-comment-id="${c.id}"]`)?.remove();
+      updateBadge();
+    }));
+  }
+  list.scrollTop = list.scrollHeight;
+
+  function updateBadge() {
+    const count = getCommentCount(itemId);
+    const existingBadge = itemEl.querySelector('.comment-badge') as HTMLElement | null;
+    if (count > 0) {
+      if (existingBadge) {
+        existingBadge.querySelector('span')!.textContent = String(count);
+        existingBadge.title = `${count} comentário${count > 1 ? 's' : ''}`;
+      } else {
+        rerender();
+      }
+    } else if (existingBadge) {
+      existingBadge.remove();
+    }
+    title.textContent = count > 0 ? `Comentários (${count})` : 'Comentários';
+  }
+
+  // Handle realtime updates for this popover
+  const handleRealtimeInPopover = (type: string, changedItemId: string, comment?: CommentWithAuthor) => {
+    if (changedItemId !== itemId) return;
+    if (type === 'insert' && comment && !list.querySelector(`[data-comment-id="${comment.id}"]`)) {
+      const canDel = comment.profile_id === currentProfile!.id || currentProfile!.is_admin;
+      list.appendChild(renderCommentEl(comment, canDel, async () => {
+        await deleteComment(comment.id, itemId);
+        list.querySelector(`[data-comment-id="${comment.id}"]`)?.remove();
+        updateBadge();
+      }));
+      list.scrollTop = list.scrollHeight;
+      updateBadge();
+    } else if (type === 'delete') {
+      updateBadge();
+    }
+  };
+  (window as any).__commentPopoverHandler = handleRealtimeInPopover;
+
+  // Outside click to close
+  let outsideListener: ((e: MouseEvent) => void) | null = null;
+  setTimeout(() => {
+    outsideListener = (e: MouseEvent) => {
+      if (!popup.contains(e.target as HTMLElement)) {
+        closeCommentPopover();
+      }
+    };
+    window.addEventListener('mousedown', outsideListener, true);
+  }, 0);
+
+  _commentPopoverCleanup = () => {
+    popup.remove();
+    if (outsideListener) window.removeEventListener('mousedown', outsideListener, true);
+    (window as any).__commentPopoverHandler = null;
+  };
+
+  input.focus();
 }
 
 // --- Link preview popup (Google Docs style) ---
@@ -4311,6 +5557,16 @@ layer.addEventListener('click', (e: MouseEvent) => {
   if (anchorEl) {
     e.preventDefault();
   }
+});
+
+// --- Embed fullscreen button ---
+
+layer.addEventListener('click', (e: MouseEvent) => {
+  const btn = (e.target as HTMLElement).closest('[data-action="embed-fullscreen"]');
+  if (!btn) return;
+  e.stopPropagation();
+  const itemEl = btn.closest('[data-item-id]') as HTMLElement | null;
+  if (itemEl?.dataset.itemId) openEmbedFullscreen(itemEl.dataset.itemId);
 });
 
 // --- Board search (Ctrl+F) ---
@@ -4655,6 +5911,7 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
 
 // Connection context menu
 layer.addEventListener('contextmenu', (e: MouseEvent) => {
+  if (isReadOnly()) return;
   const target = e.target as SVGElement;
   if (target.classList?.contains('conn-hit')) {
     e.preventDefault();
@@ -4991,6 +6248,8 @@ window.addEventListener('keydown', (e: KeyboardEvent) => {
   if (currentView !== 'board') return;
   if (editingId) return;
   if (presenting) return; // Presentation mode has its own key handler
+  const tag = (e.target as HTMLElement)?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
   const ctrl = e.ctrlKey || e.metaKey;
 
@@ -4998,6 +6257,13 @@ window.addEventListener('keydown', (e: KeyboardEvent) => {
   if (ctrl && e.key === 'f') {
     e.preventDefault();
     openSearch();
+    return;
+  }
+
+  // Block editing shortcuts for viewers (allow search, zoom, copy)
+  if (isReadOnly()) {
+    if (ctrl && e.key === 'f') { e.preventDefault(); openSearch(); }
+    if (ctrl && e.key === '0') { e.preventDefault(); zoomToFit(); }
     return;
   }
 

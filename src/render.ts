@@ -1,5 +1,6 @@
 import type { Board, BoardItem, BoardState } from './types';
 import { isIdbRef, getImage } from './imageStore';
+import { getCommentCount } from './comments';
 
 /** Detect whether a string contains HTML tags */
 export function isHtml(str: string): boolean {
@@ -72,6 +73,8 @@ interface ToolbarCallbacks {
   onImport: () => void;
   onPresent: () => void;
   onSlideOrder: () => void;
+  onHistory: () => void;
+  onShare: () => void;
   onToggleTheme: () => void;
 }
 
@@ -90,6 +93,7 @@ export interface SidebarCallbacks {
   onAddBoard: () => void;
   onConnect: () => void;
   onDraw: () => void;
+  onAddEmbed: (file: File) => void;
 }
 
 export function renderSidebar(
@@ -172,6 +176,23 @@ export function renderSidebar(
   btnBoard.innerHTML = svgEl('M3 3h18v18H3z M3 9h18 M9 9v12', '0 0 24 24');
   btnBoard.addEventListener('click', cb.onAddBoard);
 
+  // Embed tool (HTML interativo)
+  const btnEmbed = document.createElement('button');
+  btnEmbed.className = 'sidebar-btn';
+  btnEmbed.dataset.tooltip = 'Embed HTML';
+  btnEmbed.innerHTML = svgEl('M4 5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5z M7 8l3 4-3 4 M13 16h4');
+
+  const embedInput = document.createElement('input');
+  embedInput.type = 'file';
+  embedInput.accept = '.html,.htm';
+  embedInput.style.display = 'none';
+  embedInput.addEventListener('change', () => {
+    const file = embedInput.files?.[0];
+    if (file) cb.onAddEmbed(file);
+    embedInput.value = '';
+  });
+  btnEmbed.addEventListener('click', () => embedInput.click());
+
   // Connect tool
   const btnConnect = document.createElement('button');
   btnConnect.className = 'sidebar-btn';
@@ -180,7 +201,7 @@ export function renderSidebar(
   btnConnect.innerHTML = svgEl('M8 12h8 M16 8l4 4-4 4 M4 8a4 4 0 0 1 0 8');
   btnConnect.addEventListener('click', cb.onConnect);
 
-  sidebar.append(btnSelect, sep0, btnText, btnImage, btnColor, btnLink, btnDraw, fileInput, sep, btnFrame, btnBoard, btnConnect);
+  sidebar.append(btnSelect, sep0, btnText, btnImage, btnColor, btnLink, btnDraw, fileInput, sep, btnFrame, btnBoard, btnEmbed, embedInput, btnConnect);
   container.prepend(sidebar);
   return sidebar;
 }
@@ -196,6 +217,7 @@ export function renderToolbar(
   // Home button
   const homeBtn = document.createElement('button');
   homeBtn.className = 'toolbar-btn-icon';
+  homeBtn.id = 'btn-home';
   homeBtn.title = 'Voltar ao início';
   homeBtn.innerHTML = svgEl('M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z M9 22V12h6v10');
   homeBtn.addEventListener('click', cb.onHome);
@@ -329,6 +351,21 @@ export function renderToolbar(
   btnPresent.innerHTML = svgEl('M5 3l14 9-14 9V3z');
   btnPresent.addEventListener('click', cb.onPresent);
 
+  const btnHistory = document.createElement('button');
+  btnHistory.className = 'toolbar-btn-icon';
+  btnHistory.id = 'btn-history';
+  btnHistory.title = 'Histórico de versões';
+  btnHistory.innerHTML = svgEl('M12 8v4l3 3m6-3a9 9 0 1 1-18 0 9 9 0 0 1 18 0z');
+  btnHistory.addEventListener('click', cb.onHistory);
+
+  const btnShare = document.createElement('button');
+  btnShare.className = 'toolbar-btn-icon';
+  btnShare.id = 'btn-share';
+  btnShare.title = 'Compartilhar link';
+  btnShare.innerHTML = svgEl('M8.59 16.58L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.42z M4 12a8 8 0 1 1 16 0 8 8 0 0 1-16 0z', '0 0 24 24');
+  btnShare.innerHTML = `<svg viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z"/></svg>`;
+  btnShare.addEventListener('click', cb.onShare);
+
   const spacer = document.createElement('span');
   spacer.style.flex = '1';
 
@@ -449,7 +486,12 @@ export function renderToolbar(
 
   shortcutsWrap.appendChild(btnShortcuts);
 
-  toolbar.append(homeBtn, nameEl, sep1, btnUndo, btnRedo, sep2, exportWrap, btnImport, spacer, slideOrderWrap, btnPresent, sep3, zoomGroup, btnTheme, shortcutsWrap);
+  // Presence avatars container
+  const presenceAvatars = document.createElement('div');
+  presenceAvatars.className = 'presence-avatars';
+  presenceAvatars.id = 'presence-avatars';
+
+  toolbar.append(homeBtn, nameEl, sep1, btnUndo, btnRedo, sep2, exportWrap, btnImport, spacer, slideOrderWrap, btnPresent, btnHistory, btnShare, sep3, zoomGroup, btnTheme, shortcutsWrap, presenceAvatars);
   container.prepend(toolbar);
   return toolbar;
 }
@@ -777,6 +819,40 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
     el.appendChild(svg);
   }
 
+  if (item.type === 'embed') {
+    const handle = document.createElement('div');
+    handle.className = 'embed-handle';
+
+    const title = document.createElement('span');
+    title.className = 'embed-handle-title';
+    title.textContent = item.sourceUrl || 'Embed HTML';
+
+    const fullscreenBtn = document.createElement('button');
+    fullscreenBtn.className = 'embed-fullscreen-btn';
+    fullscreenBtn.title = 'Tela cheia';
+    fullscreenBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>';
+    fullscreenBtn.dataset.action = 'embed-fullscreen';
+
+    handle.append(title, fullscreenBtn);
+    el.appendChild(handle);
+
+    const iframe = document.createElement('iframe');
+    iframe.className = 'embed-iframe';
+    iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+    iframe.setAttribute('loading', 'lazy');
+    if (isIdbRef(item.content)) {
+      getImage(item.content).then(html => {
+        if (html) iframe.srcdoc = html;
+      });
+    } else if (item.content.startsWith('http')) {
+      iframe.src = item.content;
+    } else {
+      iframe.srcdoc = item.content;
+    }
+    iframe.style.pointerEvents = isSelected ? 'auto' : 'none';
+    el.appendChild(iframe);
+  }
+
   // Lock indicator
   if (item.locked) {
     const lockIcon = document.createElement('div');
@@ -805,6 +881,19 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
       tagBar.appendChild(chip);
     }
     el.appendChild(tagBar);
+  }
+
+  // Comment badge
+  if (item.type !== 'frame') {
+    const count = getCommentCount(item.id);
+    if (count > 0) {
+      const badge = document.createElement('button');
+      badge.className = 'comment-badge';
+      badge.dataset.action = 'comments';
+      badge.title = `${count} comentário${count > 1 ? 's' : ''}`;
+      badge.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>${count}</span>`;
+      el.appendChild(badge);
+    }
   }
 
   if (isSelected) {
@@ -884,6 +973,12 @@ export function syncSelectionVisual(
       }
     } else if (!isSelected && existingHandles.length > 0) {
       existingHandles.forEach(h => h.remove());
+    }
+
+    // Embed iframe: toggle pointer-events on selection
+    const embedIframe = htmlEl.querySelector('.embed-iframe') as HTMLIFrameElement | null;
+    if (embedIframe) {
+      embedIframe.style.pointerEvents = isSelected ? 'auto' : 'none';
     }
 
     // Image link button: only show when selected AND has a link
@@ -1024,9 +1119,18 @@ export interface HomeCallbacks {
   onNewBoard: () => void;
   onDeleteBoard: (boardId: string) => void;
   onArchiveBoard: (boardId: string) => void;
+  onDuplicateBoard: (boardId: string) => void;
+  onToggleFavorite: (boardId: string) => void;
+  isFavorite: (boardId: string) => boolean;
   onRenameBoard: (boardId: string, name: string) => void;
   onUpdateDescription: (boardId: string, desc: string) => void;
   onToggleTheme: () => void;
+  onAdmin?: () => void;
+  onLogout?: () => void;
+  isAdmin?: boolean;
+  userName?: string;
+  userColor?: string;
+  userAvatar?: string | null;
 }
 
 export function renderHome(
@@ -1070,7 +1174,61 @@ export function renderHome(
     homeThemeBtn.innerHTML = svgEl(nowDark ? sunP : moonP);
   });
 
+  if (cb.isAdmin && cb.onAdmin) {
+    const adminBtn = document.createElement('button');
+    adminBtn.className = 'toolbar-btn';
+    adminBtn.textContent = 'Gerenciar Usuarios';
+    adminBtn.addEventListener('click', cb.onAdmin);
+    headerRight.append(adminBtn);
+  }
+
   headerRight.append(newBtn, homeThemeBtn);
+
+  if (cb.userName) {
+    const userBtn = document.createElement('button');
+    userBtn.className = 'user-menu-btn';
+    userBtn.style.background = cb.userColor || '#c0392b';
+    if (cb.userAvatar) {
+      userBtn.style.backgroundImage = `url(${cb.userAvatar})`;
+      userBtn.textContent = '';
+    } else {
+      userBtn.textContent = cb.userName[0].toUpperCase();
+    }
+    userBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const existing = header.querySelector('.user-menu-dropdown');
+      if (existing) { existing.remove(); return; }
+      const drop = document.createElement('div');
+      drop.className = 'user-menu-dropdown';
+      drop.style.position = 'absolute';
+      drop.style.top = '60px';
+      drop.style.right = '0';
+
+      const nameItem = document.createElement('div');
+      nameItem.className = 'user-menu-item';
+      nameItem.style.fontWeight = '600';
+      nameItem.style.cursor = 'default';
+      nameItem.textContent = cb.userName!;
+      drop.append(nameItem);
+
+      const sep = document.createElement('div');
+      sep.className = 'user-menu-sep';
+      drop.append(sep);
+
+      const logoutItem = document.createElement('button');
+      logoutItem.className = 'user-menu-item';
+      logoutItem.textContent = 'Sair';
+      logoutItem.addEventListener('click', () => cb.onLogout?.());
+      drop.append(logoutItem);
+
+      header.style.position = 'relative';
+      header.append(drop);
+      const onDoc = () => { drop.remove(); document.removeEventListener('click', onDoc); };
+      setTimeout(() => document.addEventListener('click', onDoc), 0);
+    });
+    headerRight.append(userBtn);
+  }
+
   header.append(title, headerRight);
   wrapper.appendChild(header);
 
@@ -1081,7 +1239,7 @@ export function renderHome(
   const searchInput = document.createElement('input');
   searchInput.type = 'text';
   searchInput.className = 'home-search';
-  searchInput.placeholder = 'Buscar boards…';
+  searchInput.placeholder = 'Buscar boards, textos, tags…';
   controls.appendChild(searchInput);
   wrapper.appendChild(controls);
 
@@ -1129,7 +1287,14 @@ export function renderHome(
     if (!searchQuery) return list;
     return list.filter(b =>
       b.name.toLowerCase().includes(searchQuery) ||
-      (b.description || '').toLowerCase().includes(searchQuery)
+      (b.description || '').toLowerCase().includes(searchQuery) ||
+      b.items.some(item =>
+        (item.type === 'text' || item.type === 'note' || item.type === 'link') &&
+        item.content.toLowerCase().includes(searchQuery)
+      ) ||
+      b.items.some(item =>
+        item.tags?.some(tag => tag.toLowerCase().includes(searchQuery))
+      )
     );
   }
 
@@ -1137,6 +1302,19 @@ export function renderHome(
     const card = document.createElement('div');
     card.className = 'board-card';
     card.addEventListener('click', () => cb.onOpenBoard(board.id));
+
+    // Favorite star
+    const isFav = cb.isFavorite(board.id);
+    const star = document.createElement('button');
+    star.className = `board-card-star${isFav ? ' active' : ''}`;
+    star.title = isFav ? 'Remover dos favoritos' : 'Favoritar';
+    star.innerHTML = isFav
+      ? '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>'
+      : '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z" fill="none" stroke="currentColor" stroke-width="2"/></svg>';
+    star.addEventListener('click', (e) => {
+      e.stopPropagation();
+      cb.onToggleFavorite(board.id);
+    });
 
     const name = document.createElement('div');
     name.className = 'board-card-name';
@@ -1156,7 +1334,7 @@ export function renderHome(
     dateSpan.textContent = formatRelativeDate(board.updatedAt || board.createdAt);
 
     meta.append(itemCount, dateSpan);
-    card.append(name, desc, meta);
+    card.append(star, name, desc, meta);
 
     // Context menu
     card.addEventListener('contextmenu', (e) => {
@@ -1224,6 +1402,16 @@ export function renderHome(
         }
       });
 
+      menuItems.push({
+        label: cb.isFavorite(board.id) ? '★ Desfavoritar' : '☆ Favoritar',
+        action: () => cb.onToggleFavorite(board.id)
+      });
+
+      menuItems.push({
+        label: 'Duplicar',
+        action: () => cb.onDuplicateBoard(board.id)
+      });
+
       if (board.archived) {
         menuItems.push({ label: 'Desarquivar', action: () => cb.onArchiveBoard(board.id) });
       } else {
@@ -1254,9 +1442,12 @@ export function renderHome(
     const active = topLevel.filter(b => !b.archived);
     const archived = topLevel.filter(b => b.archived);
 
-    const sortedActive = filterBoards([...active]).sort(
-      (a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt)
-    );
+    const sortedActive = filterBoards([...active]).sort((a, b) => {
+      const aFav = cb.isFavorite(a.id) ? 1 : 0;
+      const bFav = cb.isFavorite(b.id) ? 1 : 0;
+      if (aFav !== bFav) return bFav - aFav;
+      return (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt);
+    });
     const sortedArchived = filterBoards([...archived]).sort(
       (a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt)
     );

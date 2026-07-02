@@ -18,6 +18,7 @@ export function createItem(
     frame: { w: 400, h: 300 },
     board: { w: 200, h: 140 },
     draw: { w: 100, h: 100 },
+    embed: { w: 800, h: 500 },
   };
 
   return {
