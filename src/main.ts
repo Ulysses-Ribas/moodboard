@@ -140,9 +140,9 @@ let dragging: {
 let resizing: {
   id: string;
   corner: 'nw' | 'ne' | 'sw' | 'se';
-  ratio: number;
-  /** Original item bounds at drag start */
   origX: number; origY: number; origW: number; origH: number;
+  others: { id: string; origX: number; origY: number; origW: number; origH: number }[];
+  bbox: { minX: number; minY: number; maxX: number; maxY: number };
 } | null = null;
 let editingId: string | null = null;
 let selectionToolbar: HTMLElement | null = null;
@@ -2825,6 +2825,77 @@ onRemoteCursor((userId, x, y) => {
   updateRemoteCursor(userId, x, y);
 });
 
+// --- @Mention Autocomplete ---
+
+function getMentionableUsers(): { id: string; name: string }[] {
+  const users: { id: string; name: string }[] = [];
+  if (currentProfile) {
+    users.push({ id: currentProfile.id, name: currentProfile.display_name || currentProfile.email });
+  }
+  for (const u of getOnlineUsers()) {
+    users.push({ id: u.id, name: u.profile.display_name || '?' });
+  }
+  return users;
+}
+
+let mentionDropdown: HTMLElement | null = null;
+
+function closeMentionDropdown(): void {
+  if (mentionDropdown) {
+    mentionDropdown.remove();
+    mentionDropdown = null;
+  }
+}
+
+function showMentionDropdown(
+  anchor: HTMLElement,
+  query: string,
+  onSelect: (name: string) => void
+): void {
+  closeMentionDropdown();
+  const users = getMentionableUsers().filter(u =>
+    u.name.toLowerCase().includes(query.toLowerCase())
+  );
+  if (users.length === 0) return;
+
+  mentionDropdown = document.createElement('div');
+  mentionDropdown.className = 'mention-dropdown';
+
+  for (const u of users) {
+    const opt = document.createElement('div');
+    opt.className = 'mention-option';
+    opt.textContent = u.name;
+    opt.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      onSelect(u.name);
+      closeMentionDropdown();
+    });
+    mentionDropdown.appendChild(opt);
+  }
+
+  const rect = anchor.getBoundingClientRect();
+  mentionDropdown.style.left = rect.left + 'px';
+  mentionDropdown.style.top = (rect.bottom + 4) + 'px';
+  document.body.appendChild(mentionDropdown);
+}
+
+function handleMentionInput(input: HTMLTextAreaElement): void {
+  const val = input.value;
+  const cursor = input.selectionStart || 0;
+  const before = val.slice(0, cursor);
+  const match = before.match(/@(\w*)$/);
+  if (match) {
+    showMentionDropdown(input, match[1], (name) => {
+      const prefix = before.slice(0, before.length - match[0].length);
+      input.value = prefix + '@' + name + ' ' + val.slice(cursor);
+      input.selectionStart = input.selectionEnd = prefix.length + name.length + 2;
+      input.dispatchEvent(new Event('input'));
+    });
+  } else {
+    closeMentionDropdown();
+  }
+}
+
 function setupCommentSync(boardId: string) {
   unsubscribeComments();
   subscribeToComments(boardId, (type, itemId, comment) => {
@@ -3088,14 +3159,36 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
   if (!item.locked && item.type !== 'frame') item.zIndex = Date.now();
 
   if (handleEl) {
-    if (item.locked) return; // Don't resize locked items
+    if (item.locked) return;
     const corner = (handleEl as HTMLElement).dataset.corner as 'nw' | 'ne' | 'sw' | 'se' || 'se';
-    selectOnly(id);
+    const others: { id: string; origX: number; origY: number; origW: number; origH: number }[] = [];
+    for (const sid of selectedIds) {
+      if (sid === id) continue;
+      const si = findItem(sid);
+      if (si && !si.locked) {
+        others.push({ id: sid, origX: si.position.x, origY: si.position.y, origW: si.size.w, origH: si.size.h });
+      }
+    }
+    if (!selectedIds.has(id)) selectOnly(id);
+    // Group anchor = bounding box of every item that will actually scale together
+    // (dragged item + unlocked others), so multi-select resize pins the far edge
+    // of the whole group instead of just the dragged item's own opposite corner.
+    let bbox = {
+      minX: item.position.x, minY: item.position.y,
+      maxX: item.position.x + item.size.w, maxY: item.position.y + item.size.h,
+    };
+    for (const o of others) {
+      bbox = {
+        minX: Math.min(bbox.minX, o.origX), minY: Math.min(bbox.minY, o.origY),
+        maxX: Math.max(bbox.maxX, o.origX + o.origW), maxY: Math.max(bbox.maxY, o.origY + o.origH),
+      };
+    }
     resizing = {
       id, corner,
-      ratio: item.size.w / item.size.h,
       origX: item.position.x, origY: item.position.y,
       origW: item.size.w, origH: item.size.h,
+      others,
+      bbox,
     };
     for (const iframe of layer.querySelectorAll('.embed-iframe') as NodeListOf<HTMLElement>) {
       iframe.style.pointerEvents = 'none';
@@ -3779,31 +3872,44 @@ window.addEventListener('mousemove', (e: MouseEvent) => {
     const bp = screenToBoard(e.clientX - rect.left, e.clientY - rect.top, vp);
     const item = findItem(resizing.id);
     if (item) {
-      const { corner, origX, origY, origW, origH, ratio } = resizing;
+      const { corner, origX, origY, origW, origH, bbox } = resizing;
       const MIN_W = item.type === 'image' ? 60 : 80;
       const MIN_H = item.type === 'image' ? 40 : 50;
-      const lockRatio = item.type === 'image';
+      const lockRatio = item.type === 'image' && !e.shiftKey;
 
-      let newX = item.position.x, newY = item.position.y;
-      let newW = item.size.w, newH = item.size.h;
+      // Anchor = opposite corner of the WHOLE selected group's bounding box (not
+      // just the dragged item's own corner), so the far edge of the group stays
+      // pinned instead of drifting to the dragged item's edge when it isn't the
+      // outermost item in the selection.
+      const anchorX = (corner === 'se' || corner === 'ne') ? bbox.minX : bbox.maxX;
+      const anchorY = (corner === 'se' || corner === 'sw') ? bbox.minY : bbox.maxY;
 
-      if (corner === 'se') {
-        newW = Math.max(MIN_W, bp.x - origX);
-        newH = lockRatio ? newW / ratio : Math.max(MIN_H, bp.y - origY);
-      } else if (corner === 'sw') {
-        newW = Math.max(MIN_W, (origX + origW) - bp.x);
-        newH = lockRatio ? newW / ratio : Math.max(MIN_H, bp.y - origY);
-        newX = (origX + origW) - newW;
-      } else if (corner === 'ne') {
-        newW = Math.max(MIN_W, bp.x - origX);
-        newH = lockRatio ? newW / ratio : Math.max(MIN_H, (origY + origH) - bp.y);
-        newY = lockRatio ? origY + origH - newH : (origY + origH) - newH;
-      } else if (corner === 'nw') {
-        newW = Math.max(MIN_W, (origX + origW) - bp.x);
-        newH = lockRatio ? newW / ratio : Math.max(MIN_H, (origY + origH) - bp.y);
-        newX = (origX + origW) - newW;
-        newY = lockRatio ? origY + origH - newH : (origY + origH) - newH;
+      // The dragged item's own corner (pre-drag) that the cursor is driving.
+      const dragX0 = (corner === 'se' || corner === 'ne') ? origX + origW : origX;
+      const dragY0 = (corner === 'se' || corner === 'sw') ? origY + origH : origY;
+
+      let scaleX = dragX0 !== anchorX ? (bp.x - anchorX) / (dragX0 - anchorX) : 1;
+      let scaleY = dragY0 !== anchorY ? (bp.y - anchorY) / (dragY0 - anchorY) : 1;
+
+      if (lockRatio) {
+        const s = Math.abs(scaleX - 1) >= Math.abs(scaleY - 1) ? scaleX : scaleY;
+        scaleX = s; scaleY = s;
       }
+
+      // Never let the dragged item shrink past its minimum size.
+      const minScaleX = MIN_W / origW;
+      const minScaleY = MIN_H / origH;
+      if (scaleX < minScaleX) scaleX = minScaleX;
+      if (scaleY < minScaleY) scaleY = minScaleY;
+      if (lockRatio) {
+        const s = Math.max(scaleX, scaleY);
+        scaleX = s; scaleY = s;
+      }
+
+      const newX = anchorX + (origX - anchorX) * scaleX;
+      const newY = anchorY + (origY - anchorY) * scaleY;
+      const newW = origW * scaleX;
+      const newH = origH * scaleY;
 
       item.position.x = newX;
       item.position.y = newY;
@@ -3811,6 +3917,21 @@ window.addEventListener('mousemove', (e: MouseEvent) => {
       item.size.h = newH;
       updateItemPosition(layer, item.id, newX, newY);
       updateItemSize(layer, item.id, newW, newH);
+
+      // Scale other selected items using the same group anchor + scale factors.
+      if (resizing.others.length > 0) {
+        for (const o of resizing.others) {
+          const si = findItem(o.id);
+          if (!si) continue;
+          si.size.w = Math.max(20, o.origW * scaleX);
+          si.size.h = Math.max(20, o.origH * scaleY);
+          si.position.x = anchorX + (o.origX - anchorX) * scaleX;
+          si.position.y = anchorY + (o.origY - anchorY) * scaleY;
+          updateItemPosition(layer, si.id, si.position.x, si.position.y);
+          updateItemSize(layer, si.id, si.size.w, si.size.h);
+        }
+      }
+
       // Reposition selection toolbar while resizing
       if (selectionToolbar && selectionToolbarItemId === resizing.id) {
         const stItemEl = layer.querySelector(`[data-item-id="${selectionToolbarItemId}"]`) as HTMLElement | null;
@@ -4494,6 +4615,112 @@ function createEditToolbar(contentDiv: HTMLElement, editItem?: import('./types')
 
   headingWrap.appendChild(headingBtn);
   toolbar.appendChild(headingWrap);
+
+  // Wrap any leading loose (unwrapped) text nodes at the start of contentDiv into
+  // a real line <div>, so the first line can be targeted like every other line
+  // (browsers only wrap subsequent lines in <div> after pressing Enter).
+  function ensureFirstLineWrapped() {
+    const firstChild = contentDiv.firstChild;
+    if (!firstChild) return;
+    if (firstChild.nodeType === Node.ELEMENT_NODE && (firstChild as HTMLElement).tagName === 'DIV') return;
+    const group: ChildNode[] = [];
+    let node: ChildNode | null = firstChild;
+    while (node && !(node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'DIV')) {
+      const next: ChildNode | null = node.nextSibling;
+      group.push(node);
+      node = next;
+    }
+    if (group.length === 0) return;
+    if (group.length === 1 && group[0].nodeType === Node.ELEMENT_NODE && (group[0] as HTMLElement).tagName === 'BR') return;
+    const wrapper = document.createElement('div');
+    contentDiv.insertBefore(wrapper, group[0]);
+    group.forEach(n => wrapper.appendChild(n));
+  }
+
+  // Returns the top-level line <div> elements that the current selection spans,
+  // so list-style toggles can apply to every selected line, not just one.
+  function getSelectedLineEls(): HTMLElement[] {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !contentDiv.contains(sel.anchorNode)) return [];
+    ensureFirstLineWrapped();
+    const range = sel.getRangeAt(0);
+    const lines: HTMLElement[] = [];
+    for (const child of Array.from(contentDiv.children)) {
+      if (child.tagName === 'DIV' && range.intersectsNode(child)) {
+        lines.push(child as HTMLElement);
+      }
+    }
+    if (lines.length === 0) {
+      const line = (sel.anchorNode as any)?.parentElement?.closest('div');
+      if (line && line !== contentDiv && contentDiv.contains(line)) lines.push(line as HTMLElement);
+    }
+    return lines;
+  }
+
+  // Checklist button
+  const checklistBtn = createBtn(
+    svgIcon('M1 3h3v3H1z M6 4.5h9 M1 8h3v3H1z M6 9.5h9 M1 13h3v3H1z M6 14.5h9'),
+    'Lista de tarefas', '', () => {
+      const lines = getSelectedLineEls();
+      if (lines.length === 0) {
+        document.execCommand('insertHTML', false,
+          '<div class="checklist-item"><input type="checkbox" class="checklist-cb">');
+        return;
+      }
+      const allChecked = lines.every(l => l.querySelector('.checklist-cb'));
+      for (const line of lines) {
+        const dot = line.querySelector('.bullet-dot');
+        if (dot) { dot.remove(); line.classList.remove('bullet-item'); }
+        const existingCb = line.querySelector('.checklist-cb');
+        if (allChecked) {
+          existingCb?.remove();
+          line.classList.remove('checklist-item');
+        } else if (!existingCb) {
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.className = 'checklist-cb';
+          line.insertBefore(cb, line.firstChild);
+          line.classList.add('checklist-item');
+        }
+      }
+    }
+  );
+  toolbar.appendChild(createSep());
+  toolbar.appendChild(checklistBtn);
+
+  // Topic (bullet) button
+  const bulletIconHtml = '<svg viewBox="0 0 16 16" width="14" height="14">'
+    + '<circle cx="2.5" cy="4.5" r="1.5" fill="currentColor" stroke="none"/>'
+    + '<circle cx="2.5" cy="9.5" r="1.5" fill="currentColor" stroke="none"/>'
+    + '<circle cx="2.5" cy="14.5" r="1.5" fill="currentColor" stroke="none"/>'
+    + '<path d="M6 4.5h9 M6 9.5h9 M6 14.5h9" /></svg>';
+  const bulletBtn = createBtn(
+    bulletIconHtml,
+    'Tópicos', '', () => {
+      const lines = getSelectedLineEls();
+      if (lines.length === 0) {
+        document.execCommand('insertHTML', false,
+          '<div class="bullet-item"><span class="bullet-dot"></span></div>');
+        return;
+      }
+      const allBulleted = lines.every(l => l.querySelector('.bullet-dot'));
+      for (const line of lines) {
+        const cb = line.querySelector('.checklist-cb');
+        if (cb) { cb.remove(); line.classList.remove('checklist-item'); }
+        const existingDot = line.querySelector('.bullet-dot');
+        if (allBulleted) {
+          existingDot?.remove();
+          line.classList.remove('bullet-item');
+        } else if (!existingDot) {
+          const dot = document.createElement('span');
+          dot.className = 'bullet-dot';
+          line.insertBefore(dot, line.firstChild);
+          line.classList.add('bullet-item');
+        }
+      }
+    }
+  );
+  toolbar.appendChild(bulletBtn);
 
   function updateToolbarState() {
     boldBtn.classList.toggle('active', document.queryCommandState('bold'));
@@ -5185,6 +5412,7 @@ async function showCommentPopover(itemEl: HTMLElement, itemId: string) {
     sendBtn.disabled = !input.value.trim();
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 80) + 'px';
+    handleMentionInput(input);
   });
 
   const doSend = async () => {
@@ -5556,6 +5784,23 @@ layer.addEventListener('click', (e: MouseEvent) => {
   const anchorEl = target.closest('a') as HTMLAnchorElement | null;
   if (anchorEl) {
     e.preventDefault();
+  }
+});
+
+// --- Checklist checkbox toggle ---
+layer.addEventListener('change', (e: Event) => {
+  const target = e.target as HTMLElement;
+  if (target instanceof HTMLInputElement && target.type === 'checkbox' && target.classList.contains('checklist-cb')) {
+    const itemEl = target.closest('[data-item-id]') as HTMLElement;
+    if (!itemEl) return;
+    const id = itemEl.dataset.itemId!;
+    const item = findItem(id);
+    if (!item) return;
+    const contentDiv = itemEl.querySelector('.item-content') as HTMLElement;
+    if (contentDiv) {
+      item.content = contentDiv.innerHTML;
+      commit();
+    }
   }
 });
 
