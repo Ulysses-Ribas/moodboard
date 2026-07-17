@@ -530,7 +530,10 @@ function showFrameMenu() {
       dim.textContent = `${preset.w}×${preset.h}`;
       item.appendChild(dim);
     }
-    item.addEventListener('click', () => {
+    item.addEventListener('click', (e) => {
+      // Stop the click from bubbling to the Frame sidebar button, which would
+      // re-trigger showFrameMenu() and immediately reopen the menu.
+      e.stopPropagation();
       menu.remove();
       if (preset.w === 0) {
         // Free-draw mode
@@ -3787,6 +3790,21 @@ layer.addEventListener('contextmenu', (e: MouseEvent) => {
     });
   }
 
+  // Organize (auto-tidy) options when 2+ items selected
+  if (selectedIds.size >= 2) {
+    menuItems.push({
+      label: 'Organizar →',
+      action: () => {
+        const organizeMenu: { label: string; action: () => void; separator?: boolean }[] = [
+          { label: 'Organização automática', action: () => organizeSnapToGrid() },
+          { label: 'Alinhamento horizontal', action: () => alignItems('center-v'), separator: true },
+          { label: 'Alinhamento vertical', action: () => alignItems('center-h') },
+        ];
+        showContextMenu(e.clientX + 150, e.clientY, organizeMenu);
+      }
+    });
+  }
+
   // Group / Ungroup
   if (selectedIds.size >= 2) {
     const anyGrouped = [...selectedIds].some(sid => findItem(sid)?.groupId);
@@ -6629,6 +6647,23 @@ function layoutWrap() {
     rowHeight = Math.max(rowHeight, item.size.h);
   }
 
+  commit();
+  rerender();
+}
+
+// Grid step for "encaixe em grade" — matches the canvas' visible 24px grid dots.
+const ORGANIZE_GRID = 24;
+
+/** Automatic organization: snap each selected item's top-left to the nearest
+ *  grid point. Keeps everything essentially in place while removing small
+ *  misalignments so the layout reads as tidy. */
+function organizeSnapToGrid() {
+  const items = getSelectedItems();
+  if (items.length < 2) return;
+  for (const item of items) {
+    item.position.x = Math.round(item.position.x / ORGANIZE_GRID) * ORGANIZE_GRID;
+    item.position.y = Math.round(item.position.y / ORGANIZE_GRID) * ORGANIZE_GRID;
+  }
   commit();
   rerender();
 }

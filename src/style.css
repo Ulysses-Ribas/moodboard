@@ -3272,28 +3272,58 @@ body {
 
 /* ── Comment badge on items ── */
 
-/* White square, matching .image-link-btn. Sits at the top-right; when a link
-   button is also present on the item it drops below it (see .has-linkbtn). */
+/* Default (item not selected): compact red pill with count, at the corner. */
 .comment-badge {
   position: absolute;
+  top: -8px;
+  right: -8px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  background: var(--accent, #e74c3c);
+  color: #fff;
+  border: 2px solid var(--paper);
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  z-index: 5;
+  line-height: 1;
+  transition: transform 0.12s;
+}
+
+.comment-badge svg {
+  width: 14px;
+  height: 14px;
+  fill: #fff;
+  stroke: none;
+}
+
+.comment-badge:hover {
+  transform: scale(1.15);
+}
+
+/* When the item IS selected: white square matching .image-link-btn. */
+.board-item.selected .comment-badge {
   top: 8px;
   right: 8px;
   width: 32px;
   height: 32px;
-  display: flex;
-  align-items: center;
+  gap: 0;
+  padding: 0;
   justify-content: center;
   background: var(--paper);
+  color: var(--ink-faint);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  color: var(--ink-faint);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.10);
-  cursor: pointer;
-  z-index: 5;
+  font-size: 11px;
   transition: color 0.15s, border-color 0.15s;
 }
 
-.comment-badge svg {
+.board-item.selected .comment-badge svg {
   width: 16px;
   height: 16px;
   fill: none;
@@ -3303,7 +3333,8 @@ body {
   stroke-linejoin: round;
 }
 
-.comment-badge span {
+/* Count becomes a small corner badge on the white square */
+.board-item.selected .comment-badge span {
   position: absolute;
   top: -6px;
   right: -6px;
@@ -3318,17 +3349,17 @@ body {
   font-size: 10px;
   font-weight: 700;
   line-height: 11px;
-  font-family: var(--font-sans);
   text-align: center;
 }
 
-.comment-badge:hover {
+.board-item.selected .comment-badge:hover {
   color: var(--accent);
   border-color: var(--accent);
+  transform: none;
 }
 
-/* When the link button occupies the top-right slot, stack the comment icon below it */
-.board-item.has-linkbtn .comment-badge {
+/* When selected AND a link button occupies the top-right slot, stack below it */
+.board-item.selected.has-linkbtn .comment-badge {
   top: 48px;
 }
 
