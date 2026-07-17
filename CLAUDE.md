@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working approach
+
+Before implementing any non-trivial change, first surface the risks, trade-offs, and possible alternatives — do not simply execute what was asked. Point out what could break, what the change costs (complexity, performance, maintenance, deploy/type-check implications), and at least one alternative approach when one exists, then let the user decide. Trivial changes (typos, small copy tweaks, obvious one-line fixes) can proceed directly.
+
 ## Product context
 
 Moodboard is a reference-organization tool for creative work — it collects not just visual references but also links and text notes onto a shared canvas.

@@ -636,6 +636,8 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
   el.style.top = `${item.position.y}px`;
   el.style.width = `${item.size.w}px`;
   el.style.height = `${item.size.h}px`;
+  // Rotation is image-only; ignore any stray value on other item types
+  if (item.rotation && item.type === 'image') el.style.transform = `rotate(${item.rotation}deg)`;
   el.style.zIndex = String(cssZIndex ?? item.zIndex);
 
   if (item.type === 'text') {
@@ -696,6 +698,7 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
       linkBtn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /></svg>';
       linkBtn.dataset.action = 'image-link';
       el.appendChild(linkBtn);
+      el.classList.add('has-linkbtn');
     }
   }
 
@@ -903,9 +906,20 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
       handle.dataset.corner = corner;
       el.appendChild(handle);
     }
+    // Rotation is only offered for images
+    if (item.type === 'image') el.appendChild(makeRotateHandle());
   }
 
   return el;
+}
+
+/** Rotation grip shown near the bottom-right corner of a selected item */
+export function makeRotateHandle(): HTMLElement {
+  const rot = document.createElement('div');
+  rot.className = 'rotate-handle';
+  rot.title = 'Girar';
+  rot.innerHTML = '<svg viewBox="0 0 16 16" width="11" height="11"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M13.8 2.5v2.7h-2.7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  return rot;
 }
 
 export function renderAllItems(
@@ -971,8 +985,13 @@ export function syncSelectionVisual(
         handle.dataset.corner = corner;
         htmlEl.appendChild(handle);
       }
+      const isImage = findItem?.(id)?.type === 'image';
+      if (isImage && !htmlEl.querySelector('.rotate-handle')) {
+        htmlEl.appendChild(makeRotateHandle());
+      }
     } else if (!isSelected && existingHandles.length > 0) {
       existingHandles.forEach(h => h.remove());
+      htmlEl.querySelector('.rotate-handle')?.remove();
     }
 
     // Embed iframe: toggle pointer-events on selection
@@ -993,9 +1012,11 @@ export function syncSelectionVisual(
           linkBtn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /></svg>';
           linkBtn.dataset.action = 'image-link';
           htmlEl.appendChild(linkBtn);
+          htmlEl.classList.add('has-linkbtn');
         }
       } else if (!isSelected && existingBtn) {
         existingBtn.remove();
+        htmlEl.classList.remove('has-linkbtn');
       }
     }
   }

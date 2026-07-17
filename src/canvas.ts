@@ -4,7 +4,7 @@ export type Viewport = Board['viewport'];
 type ViewportCallback = (viewport: Viewport) => void;
 
 const ZOOM_MIN = 0.1;
-const ZOOM_MAX = 3;
+const ZOOM_MAX = 5;
 const ZOOM_STEP = 0.05;
 const GRID_SIZE = 24;
 

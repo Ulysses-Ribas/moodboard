@@ -9,6 +9,10 @@ export interface BoardItem {
   sourceApp?: 'manual' | 'sondar' | 'chrome-ext';
   position: { x: number; y: number };
   size: { w: number; h: number };
+  /** Rotation in degrees, applied around the item's center (absent/0 = unrotated) */
+  rotation?: number;
+  /** Profile IDs mentioned in this item's text/note content */
+  mentions?: string[];
   tags?: string[];
   locked?: boolean;
   /** Items sharing the same groupId move/select as a unit */

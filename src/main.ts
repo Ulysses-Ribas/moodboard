@@ -144,6 +144,12 @@ let resizing: {
   others: { id: string; origX: number; origY: number; origW: number; origH: number }[];
   bbox: { minX: number; minY: number; maxX: number; maxY: number };
 } | null = null;
+let rotating: {
+  id: string;
+  centerX: number; centerY: number;  // item center in board coords
+  startAngle: number;                // pointer angle at drag start (deg)
+  origRotation: number;              // item.rotation at drag start (deg)
+} | null = null;
 let editingId: string | null = null;
 let selectionToolbar: HTMLElement | null = null;
 let selectionToolbarItemId: string | null = null;
@@ -1360,6 +1366,15 @@ function drawBoardToCanvas(
     const iw = item.size.w;
     const ih = item.size.h;
 
+    const rotated = !!item.rotation && item.type === 'image';
+    if (rotated) {
+      ctx.save();
+      const rcx = x + iw / 2, rcy = y + ih / 2;
+      ctx.translate(rcx, rcy);
+      ctx.rotate(item.rotation! * Math.PI / 180);
+      ctx.translate(-rcx, -rcy);
+    }
+
     if (item.type === 'frame') {
       ctx.fillStyle = item.color || 'rgba(216, 212, 204, 0.25)';
       ctx.fillRect(x, y, iw, ih);
@@ -1504,6 +1519,8 @@ function drawBoardToCanvas(
         tx += tw + 3;
       }
     }
+
+    if (rotated) ctx.restore();
   }
 
   // Connections
@@ -1621,6 +1638,7 @@ async function exportBoardAsSvg(frameItem?: BoardItem) {
     const y = item.position.y - minY + padding;
     const iw = item.size.w;
     const ih = item.size.h;
+    const svgStart = svg.length;
 
     if (item.type === 'frame') {
       svg += `<rect x="${x}" y="${y}" width="${iw}" height="${ih}" fill="${item.color || 'rgba(216,212,204,0.25)'}" stroke="#d8d4cc" stroke-width="2" stroke-dasharray="6 4"/>\n`;
@@ -1707,6 +1725,13 @@ async function exportBoardAsSvg(frameItem?: BoardItem) {
         svg += `<text x="${tx + 7}" y="${tagY + 13}" fill="#4a4a4a" font-size="9" font-family="monospace">${esc(tag)}</text>\n`;
         tx += tw + 3;
       }
+    }
+
+    // Wrap this item's markup in a rotation group around its center.
+    if (item.rotation && item.type === 'image') {
+      const body = svg.slice(svgStart);
+      svg = svg.slice(0, svgStart) +
+        `<g transform="rotate(${item.rotation} ${x + iw / 2} ${y + ih / 2})">\n${body}</g>\n`;
     }
   }
 
@@ -2828,72 +2853,173 @@ onRemoteCursor((userId, x, y) => {
 // --- @Mention Autocomplete ---
 
 function getMentionableUsers(): { id: string; name: string }[] {
-  const users: { id: string; name: string }[] = [];
+  const byId = new Map<string, string>();
   if (currentProfile) {
-    users.push({ id: currentProfile.id, name: currentProfile.display_name || currentProfile.email });
+    byId.set(currentProfile.id, currentProfile.display_name || currentProfile.email);
   }
   for (const u of getOnlineUsers()) {
-    users.push({ id: u.id, name: u.profile.display_name || '?' });
+    if (!byId.has(u.id)) byId.set(u.id, u.profile.display_name || '?');
   }
-  return users;
+  return Array.from(byId, ([id, name]) => ({ id, name }));
 }
 
-let mentionDropdown: HTMLElement | null = null;
+/** Tracks a mention inserted into a comment textarea (user or board) */
+type ComposeMention = { name: string; id: string; kind: 'user' | 'board' };
 
-function closeMentionDropdown(): void {
-  if (mentionDropdown) {
-    mentionDropdown.remove();
-    mentionDropdown = null;
+// ── Shared mention menu (used by comments AND text/note editing) ──
+// Filters inline by the text typed after '@', supports ArrowUp/Down + Enter/Tab,
+// and renders a single scroll container.
+
+interface MentionCandidate { kind: 'user' | 'board'; id: string; name: string; sub: string; icon: string }
+
+function getMentionCandidates(query: string): MentionCandidate[] {
+  const ql = query.toLowerCase();
+  const out: MentionCandidate[] = [];
+  for (const u of getMentionableUsers()) {
+    if (out.length >= 6) break;
+    if (u.name.toLowerCase().includes(ql)) {
+      out.push({ kind: 'user', id: u.id, name: u.name, sub: 'pessoa', icon: '@' });
+    }
+  }
+  let boardCount = 0;
+  for (const b of state.boards) {
+    if (boardCount >= 8) break;
+    if (b.id === state.activeBoardId || b.archived) continue;
+    const name = b.name || 'Sem título';
+    if (name.toLowerCase().includes(ql)) {
+      out.push({ kind: 'board', id: b.id, name, sub: `${b.items.length} itens`, icon: '⊞' });
+      boardCount++;
+    }
+  }
+  return out;
+}
+
+let mentionMenu: {
+  el: HTMLElement;
+  list: HTMLElement;
+  items: MentionCandidate[];
+  index: number;
+  onPick: (c: MentionCandidate) => void;
+} | null = null;
+
+function mentionMenuOpen(): boolean {
+  return mentionMenu !== null;
+}
+
+function closeMentionMenu(): void {
+  if (mentionMenu) {
+    mentionMenu.el.remove();
+    mentionMenu = null;
   }
 }
 
-function showMentionDropdown(
-  anchor: HTMLElement,
-  query: string,
-  onSelect: (name: string) => void
-): void {
-  closeMentionDropdown();
-  const users = getMentionableUsers().filter(u =>
-    u.name.toLowerCase().includes(query.toLowerCase())
-  );
-  if (users.length === 0) return;
+/** Open (or refresh) the mention menu at a screen rect, filtered by `query`. */
+function updateMentionMenu(rect: DOMRect, query: string, onPick: (c: MentionCandidate) => void): void {
+  const items = getMentionCandidates(query);
+  if (items.length === 0) { closeMentionMenu(); return; }
 
-  mentionDropdown = document.createElement('div');
-  mentionDropdown.className = 'mention-dropdown';
+  if (!mentionMenu) {
+    const el = document.createElement('div');
+    el.className = 'mention-dropdown';
+    const list = document.createElement('div');
+    list.className = 'mention-list';
+    el.appendChild(list);
+    document.body.appendChild(el);
+    mentionMenu = { el, list, items, index: 0, onPick };
+  } else {
+    mentionMenu.items = items;
+    mentionMenu.onPick = onPick;
+    if (mentionMenu.index >= items.length) mentionMenu.index = 0;
+  }
 
-  for (const u of users) {
+  mentionMenu.el.style.left = `${rect.left}px`;
+  mentionMenu.el.style.top = `${rect.bottom + 4}px`;
+  renderMentionMenu();
+}
+
+function renderMentionMenu(): void {
+  const m = mentionMenu;
+  if (!m) return;
+  m.list.innerHTML = '';
+  m.items.forEach((c, i) => {
     const opt = document.createElement('div');
-    opt.className = 'mention-option';
-    opt.textContent = u.name;
-    opt.addEventListener('mousedown', (e) => {
-      e.preventDefault();
-      onSelect(u.name);
-      closeMentionDropdown();
-    });
-    mentionDropdown.appendChild(opt);
-  }
+    opt.className = 'mention-option' + (i === m.index ? ' active' : '');
+    const icon = document.createElement('span');
+    icon.className = 'mention-option-icon';
+    icon.textContent = c.icon;
+    const name = document.createElement('span');
+    name.className = 'mention-option-name';
+    name.textContent = c.name;
+    const sub = document.createElement('span');
+    sub.className = 'mention-option-count';
+    sub.textContent = c.sub;
+    opt.append(icon, name, sub);
+    opt.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation(); pickMention(i); });
+    opt.addEventListener('mousemove', () => { if (m.index !== i) { m.index = i; highlightMention(); } });
+    m.list.appendChild(opt);
+  });
+}
 
-  const rect = anchor.getBoundingClientRect();
-  mentionDropdown.style.left = rect.left + 'px';
-  mentionDropdown.style.top = (rect.bottom + 4) + 'px';
-  document.body.appendChild(mentionDropdown);
+function highlightMention(): void {
+  const m = mentionMenu;
+  if (!m) return;
+  const opts = m.list.querySelectorAll('.mention-option');
+  opts.forEach((o, i) => o.classList.toggle('active', i === m.index));
+  (opts[m.index] as HTMLElement | undefined)?.scrollIntoView({ block: 'nearest' });
+}
+
+function pickMention(i: number): void {
+  const m = mentionMenu;
+  if (!m) return;
+  const c = m.items[i];
+  const cb = m.onPick;
+  closeMentionMenu();
+  cb(c);
+}
+
+/** Feed a keydown to the menu; returns true if the menu consumed the key. */
+function mentionMenuKeydown(e: KeyboardEvent): boolean {
+  const m = mentionMenu;
+  if (!m) return false;
+  switch (e.key) {
+    case 'ArrowDown': m.index = (m.index + 1) % m.items.length; highlightMention(); e.preventDefault(); return true;
+    case 'ArrowUp': m.index = (m.index - 1 + m.items.length) % m.items.length; highlightMention(); e.preventDefault(); return true;
+    case 'Enter':
+    case 'Tab': pickMention(m.index); e.preventDefault(); return true;
+    case 'Escape': closeMentionMenu(); e.preventDefault(); return true;
+  }
+  return false;
+}
+
+/** Match a trailing "@query" token (no spaces) at the caret. */
+function matchMentionToken(before: string): string | null {
+  const match = before.match(/(?:^|\s)@([^\s@]*)$/);
+  return match ? match[1] : null;
 }
 
 function handleMentionInput(input: HTMLTextAreaElement): void {
   const val = input.value;
   const cursor = input.selectionStart || 0;
   const before = val.slice(0, cursor);
-  const match = before.match(/@(\w*)$/);
-  if (match) {
-    showMentionDropdown(input, match[1], (name) => {
-      const prefix = before.slice(0, before.length - match[0].length);
-      input.value = prefix + '@' + name + ' ' + val.slice(cursor);
-      input.selectionStart = input.selectionEnd = prefix.length + name.length + 2;
-      input.dispatchEvent(new Event('input'));
-    });
-  } else {
-    closeMentionDropdown();
-  }
+  const query = matchMentionToken(before);
+  if (query === null) { closeMentionMenu(); return; }
+
+  updateMentionMenu(input.getBoundingClientRect(), query, (c) => {
+    const atPos = cursor - query.length - 1; // index of the '@'
+    const insert = '@' + c.name + ' ';
+    input.value = val.slice(0, atPos) + insert + val.slice(cursor);
+    const pos = atPos + insert.length;
+    input.selectionStart = input.selectionEnd = pos;
+    const tracked: ComposeMention[] = (input as any).__mentions || ((input as any).__mentions = []);
+    if (!tracked.some(m => m.id === c.id && m.kind === c.kind)) tracked.push({ id: c.id, name: c.name, kind: c.kind });
+    input.focus();
+    input.dispatchEvent(new Event('input'));
+  });
+}
+
+/** Route a comment-textarea keydown; returns true if the mention menu handled it. */
+function handleMentionKeydown(e: KeyboardEvent): boolean {
+  return mentionMenuKeydown(e);
 }
 
 function setupCommentSync(boardId: string) {
@@ -3100,6 +3226,7 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
     return;
   }
 
+  const rotateEl = target.closest('.rotate-handle');
   const handleEl = target.closest('.resize-handle');
   const itemEl = target.closest('[data-item-id]') as HTMLElement | null;
   if (!itemEl) return;
@@ -3107,6 +3234,26 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
   const id = itemEl.dataset.itemId!;
   const item = findItem(id);
   if (!item) return;
+
+  // Rotation grip: start rotating around the item's center
+  if (rotateEl && !isReadOnly() && !item.locked) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!selectedIds.has(id)) selectOnly(id);
+    const cx = item.position.x + item.size.w / 2;
+    const cy = item.position.y + item.size.h / 2;
+    const vp = getViewport();
+    const rect = getCanvasRect();
+    const bp = screenToBoard(e.clientX - rect.left, e.clientY - rect.top, vp);
+    rotating = {
+      id,
+      centerX: cx, centerY: cy,
+      startAngle: Math.atan2(bp.y - cy, bp.x - cx) * 180 / Math.PI,
+      origRotation: item.rotation || 0,
+    };
+    syncSelection();
+    return;
+  }
 
   // Viewers can only select and view, not drag/resize/edit
   if (isReadOnly()) {
@@ -3866,6 +4013,29 @@ window.addEventListener('mousemove', (e: MouseEvent) => {
     }
   }
 
+  if (rotating) {
+    const vp = getViewport();
+    const rect = getCanvasRect();
+    const bp = screenToBoard(e.clientX - rect.left, e.clientY - rect.top, vp);
+    const item = findItem(rotating.id);
+    if (item) {
+      const ang = Math.atan2(bp.y - rotating.centerY, bp.x - rotating.centerX) * 180 / Math.PI;
+      let rot = rotating.origRotation + (ang - rotating.startAngle);
+      // Shift snaps to 15° increments
+      if (e.shiftKey) rot = Math.round(rot / 15) * 15;
+      // Normalise to (-180, 180]
+      rot = ((rot % 360) + 360) % 360;
+      if (rot > 180) rot -= 360;
+      item.rotation = rot;
+      const el = layer.querySelector(`[data-item-id="${item.id}"]`) as HTMLElement | null;
+      if (el) el.style.transform = rot ? `rotate(${rot}deg)` : '';
+      if (selectionToolbar && selectionToolbarItemId === rotating.id) {
+        const stItemEl = layer.querySelector(`[data-item-id="${selectionToolbarItemId}"]`) as HTMLElement | null;
+        if (stItemEl) positionToolbar(selectionToolbar, stItemEl);
+      }
+    }
+  }
+
   if (resizing) {
     const vp = getViewport();
     const rect = getCanvasRect();
@@ -3873,6 +4043,53 @@ window.addEventListener('mousemove', (e: MouseEvent) => {
     const item = findItem(resizing.id);
     if (item) {
       const { corner, origX, origY, origW, origH, bbox } = resizing;
+
+      // ── Rotated single-item resize ──
+      // When the item is rotated and resized on its own, work in the item's
+      // local (unrotated) frame so the anchor corner stays pinned in world space.
+      if (item.rotation && resizing.others.length === 0) {
+        const rad = item.rotation * Math.PI / 180;
+        const cos = Math.cos(rad), sin = Math.sin(rad);
+        const MIN_W1 = item.type === 'image' ? 60 : 80;
+        const MIN_H1 = item.type === 'image' ? 40 : 50;
+        const lock = item.type === 'image' && !e.shiftKey;
+        // Signs of the anchor corner (opposite the dragged corner) in local space.
+        const ax = (corner === 'se' || corner === 'ne') ? -1 : 1;
+        const ay = (corner === 'se' || corner === 'sw') ? -1 : 1;
+        // Fixed anchor corner in world coords (from the pre-drag geometry).
+        const c0x = origX + origW / 2, c0y = origY + origH / 2;
+        const alx = ax * origW / 2, aly = ay * origH / 2;
+        const anchorWX = c0x + (alx * cos - aly * sin);
+        const anchorWY = c0y + (alx * sin + aly * cos);
+        // Pointer in local frame relative to the anchor corner.
+        const dpx = bp.x - anchorWX, dpy = bp.y - anchorWY;
+        let localX = dpx * cos + dpy * sin;   // R(-θ)
+        let localY = -dpx * sin + dpy * cos;
+        // Dragged corner lies at (-ax, -ay) direction from the anchor.
+        let newW = Math.max(MIN_W1, localX * -ax);
+        let newH = Math.max(MIN_H1, localY * -ay);
+        if (lock) {
+          const s = Math.max(newW / origW, newH / origH);
+          newW = origW * s; newH = origH * s;
+        }
+        // New center keeps the anchor corner fixed.
+        const nalx = ax * newW / 2, naly = ay * newH / 2;
+        const ncx = anchorWX - (nalx * cos - naly * sin);
+        const ncy = anchorWY - (nalx * sin + naly * cos);
+        const newX = ncx - newW / 2;
+        const newY = ncy - newH / 2;
+        item.position.x = newX;
+        item.position.y = newY;
+        item.size.w = newW;
+        item.size.h = newH;
+        updateItemPosition(layer, item.id, newX, newY);
+        updateItemSize(layer, item.id, newW, newH);
+        if (selectionToolbar && selectionToolbarItemId === resizing.id) {
+          const stItemEl = layer.querySelector(`[data-item-id="${selectionToolbarItemId}"]`) as HTMLElement | null;
+          if (stItemEl) positionToolbar(selectionToolbar, stItemEl);
+        }
+        return;
+      }
       const MIN_W = item.type === 'image' ? 60 : 80;
       const MIN_H = item.type === 'image' ? 40 : 50;
       const lockRatio = item.type === 'image' && !e.shiftKey;
@@ -4090,6 +4307,12 @@ window.addEventListener('mouseup', (e: MouseEvent) => {
       if (iframe) iframe.style.pointerEvents = el.classList.contains('selected') ? 'auto' : 'none';
     }
     commit();
+  }
+
+  if (rotating) {
+    rotating = null;
+    commit();
+    updateConnections();
   }
 
   if (resizing) {
@@ -4779,6 +5002,8 @@ function startEditing(id: string, itemEl: HTMLElement) {
   contentDiv.addEventListener('mousedown', stopDrag);
 
   const onKeyDown = (ke: KeyboardEvent) => {
+    // While the mention menu is open, let it take arrows / Enter / Tab / Escape
+    if (mentionMenuOpen() && mentionMenuKeydown(ke)) { ke.stopPropagation(); return; }
     if (ke.key === 'Escape') { finishEditing(); return; }
     if ((ke.ctrlKey || ke.metaKey) && ke.key === 'k') {
       ke.preventDefault();
@@ -4803,39 +5028,18 @@ function startEditing(id: string, itemEl: HTMLElement) {
   };
   contentDiv.addEventListener('keydown', onKeyDown);
 
-  // --- @board mention autocomplete ---
-  let mentionDropdown: HTMLElement | null = null;
-  let mentionQuery = '';
+  // --- @mention autocomplete (users + boards) ---
   let savedMentionRange: Range | null = null;
 
-  function closeMentionDropdown() {
-    if (mentionDropdown) { mentionDropdown.remove(); mentionDropdown = null; }
-    savedMentionRange = null;
-  }
-
-  /** Save the current cursor range so we can restore it after dropdown interaction */
-  function saveMentionRange() {
-    const sel = window.getSelection();
-    if (sel && sel.rangeCount > 0 && contentDiv.contains(sel.anchorNode)) {
-      savedMentionRange = sel.getRangeAt(0).cloneRange();
-    }
-  }
-
-  function insertBoardMention(boardId: string, boardName: string) {
-    // Restore saved selection into contentDiv before manipulating
+  function insertMention(c: MentionCandidate) {
     contentDiv.focus();
     const sel = window.getSelection();
     if (!sel) return;
-    if (savedMentionRange) {
-      sel.removeAllRanges();
-      sel.addRange(savedMentionRange);
-    }
+    if (savedMentionRange) { sel.removeAllRanges(); sel.addRange(savedMentionRange); }
     if (sel.rangeCount === 0) return;
     const range = sel.getRangeAt(0);
 
-    closeMentionDropdown();
-
-    // Delete the @query text
+    // Delete the "@query" text preceding the caret
     const textNode = range.startContainer;
     if (textNode.nodeType === Node.TEXT_NODE) {
       const text = textNode.textContent || '';
@@ -4847,143 +5051,32 @@ function startEditing(id: string, itemEl: HTMLElement) {
       }
     }
 
-    // Insert styled mention chip
     const chip = document.createElement('span');
-    chip.className = 'board-mention';
-    chip.dataset.boardId = boardId;
+    chip.className = c.kind === 'board' ? 'board-mention' : 'user-mention';
+    if (c.kind === 'board') chip.dataset.boardId = c.id; else chip.dataset.userId = c.id;
     chip.contentEditable = 'false';
-    chip.textContent = `@${boardName}`;
+    chip.textContent = '@' + c.name;
     range.insertNode(chip);
 
-    // Move cursor after chip
     range.setStartAfter(chip);
     range.collapse(true);
     sel.removeAllRanges();
     sel.addRange(range);
-    // Insert a space after the chip
     document.execCommand('insertText', false, ' ');
-  }
-
-  function showMentionDropdown(_query: string) {
-    // Only create the dropdown once per @ trigger; subsequent inputs update the list
-    if (mentionDropdown) {
-      // Already open — just update the filter
-      updateMentionList(_query);
-      return;
-    }
-
-    mentionDropdown = document.createElement('div');
-    mentionDropdown.className = 'mention-dropdown';
-
-    // Search input
-    const searchInput = document.createElement('input');
-    searchInput.className = 'mention-search';
-    searchInput.type = 'text';
-    searchInput.placeholder = 'Buscar board...';
-    searchInput.value = _query;
-    mentionDropdown.appendChild(searchInput);
-
-    // Board list container
-    const listEl = document.createElement('div');
-    listEl.className = 'mention-list';
-    mentionDropdown.appendChild(listEl);
-
-    // Populate list
-    function updateMentionList(q: string) {
-      const boards = state.boards.filter(b =>
-        b.id !== state.activeBoardId &&
-        !b.archived &&
-        b.name.toLowerCase().includes(q.toLowerCase())
-      ).slice(0, 8);
-      listEl.innerHTML = '';
-      if (boards.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'mention-empty';
-        empty.textContent = 'Nenhum board encontrado';
-        listEl.appendChild(empty);
-        return;
-      }
-      for (const board of boards) {
-        const opt = document.createElement('div');
-        opt.className = 'mention-option';
-        opt.dataset.boardId = board.id;
-        const icon = document.createElement('span');
-        icon.className = 'mention-option-icon';
-        icon.textContent = '⊞';
-        opt.appendChild(icon);
-        const name = document.createElement('span');
-        name.className = 'mention-option-name';
-        name.textContent = board.name || 'Sem título';
-        opt.appendChild(name);
-        const count = document.createElement('span');
-        count.className = 'mention-option-count';
-        count.textContent = `${board.items.length} itens`;
-        opt.appendChild(count);
-        opt.addEventListener('mousedown', (me) => {
-          me.preventDefault();
-          me.stopPropagation();
-          insertBoardMention(board.id, board.name || 'Sem título');
-        });
-        listEl.appendChild(opt);
-      }
-    }
-
-    updateMentionList(_query);
-
-    // Search input filters the list independently
-    searchInput.addEventListener('input', () => {
-      updateMentionList(searchInput.value);
-    });
-    // Prevent search input from stealing focus away in a way that closes editing
-    searchInput.addEventListener('mousedown', (e) => {
-      e.stopPropagation();
-    });
-    // Allow keyboard navigation inside search
-    searchInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        closeMentionDropdown();
-        contentDiv.focus();
-        e.preventDefault();
-      } else if (e.key === 'Enter') {
-        const firstOpt = listEl.querySelector('.mention-option') as HTMLElement | null;
-        if (firstOpt) {
-          const bid = firstOpt.dataset.boardId!;
-          const board = state.boards.find(b => b.id === bid);
-          if (board) {
-            contentDiv.focus();
-            // Restore selection to where @ was
-            insertBoardMention(board.id, board.name || 'Sem título');
-          }
-        }
-        e.preventDefault();
-      }
-    });
-
-    // Position near cursor
-    const selObj = window.getSelection();
-    if (selObj && selObj.rangeCount > 0) {
-      const r = selObj.getRangeAt(0).getBoundingClientRect();
-      mentionDropdown.style.left = `${r.left}px`;
-      mentionDropdown.style.top = `${r.bottom + 4}px`;
-    }
-    document.body.appendChild(mentionDropdown);
+    savedMentionRange = null;
   }
 
   const onInput = () => {
     const sel = window.getSelection();
-    if (!sel || sel.rangeCount === 0) { closeMentionDropdown(); return; }
+    if (!sel || sel.rangeCount === 0) { closeMentionMenu(); return; }
     const range = sel.getRangeAt(0);
     const node = range.startContainer;
-    if (node.nodeType !== Node.TEXT_NODE) { closeMentionDropdown(); return; }
-    const text = (node.textContent || '').substring(0, range.startOffset);
-    const atIdx = text.lastIndexOf('@');
-    if (atIdx >= 0 && (atIdx === 0 || text[atIdx - 1] === ' ' || text[atIdx - 1] === '\n')) {
-      mentionQuery = text.substring(atIdx + 1);
-      saveMentionRange(); // save cursor position before dropdown steals focus
-      showMentionDropdown(mentionQuery);
-    } else {
-      closeMentionDropdown();
-    }
+    if (node.nodeType !== Node.TEXT_NODE) { closeMentionMenu(); return; }
+    const before = (node.textContent || '').substring(0, range.startOffset);
+    const query = matchMentionToken(before);
+    if (query === null) { closeMentionMenu(); return; }
+    savedMentionRange = range.cloneRange();
+    updateMentionMenu(range.getBoundingClientRect(), query, insertMention);
   };
   contentDiv.addEventListener('input', onInput);
 
@@ -4992,7 +5085,7 @@ function startEditing(id: string, itemEl: HTMLElement) {
     outsideListener = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
       if (contentDiv.contains(target) || toolbar.contains(target)) return;
-      if (mentionDropdown && mentionDropdown.contains(target)) return;
+      if (mentionMenu && mentionMenu.el.contains(target)) return;
       finishEditing();
     };
     window.addEventListener('mousedown', outsideListener, true);
@@ -5011,12 +5104,23 @@ function startEditing(id: string, itemEl: HTMLElement) {
     contentDiv.removeEventListener('mousedown', stopDrag);
     contentDiv.removeEventListener('keydown', onKeyDown);
     contentDiv.removeEventListener('input', onInput);
-    closeMentionDropdown();
+    closeMentionMenu();
     if ((toolbar as any).__cleanupSelChange) (toolbar as any).__cleanupSelChange();
 
     contentDiv.contentEditable = 'false';
     contentDiv.classList.remove('editing');
     toolbar.remove();
+
+    // Collect mentioned profile IDs from chips before serialising
+    const mentionIds = Array.from(
+      new Set(
+        Array.from(contentDiv.querySelectorAll('.user-mention'))
+          .map(el => (el as HTMLElement).dataset.userId)
+          .filter((v): v is string => !!v)
+      )
+    );
+    if (mentionIds.length > 0) editItem.mentions = mentionIds;
+    else delete editItem.mentions;
 
     let html = contentDiv.innerHTML;
     html = cleanContentHtml(html);
@@ -5316,6 +5420,55 @@ function timeAgo(dateStr: string): string {
   return `${days}d`;
 }
 
+/** Convert visible "@Name" tokens into stored markers. Users become
+ *  "@[Name](id)"; boards become "@[Name](b:id)" so they can be told apart. */
+function serializeMentions(text: string, mentions: ComposeMention[]): string {
+  let out = text;
+  // Longest names first so "@Ana" doesn't clobber "@Ana Paula"
+  for (const m of [...mentions].sort((a, b) => b.name.length - a.name.length)) {
+    const ref = m.kind === 'board' ? `b:${m.id}` : m.id;
+    out = out.split('@' + m.name).join(`@[${m.name}](${ref})`);
+  }
+  return out;
+}
+
+/** Render stored comment text, turning "@[Name](id)" markers into chips.
+ *  A "b:" prefix on the id marks a board mention (navigable). */
+function appendMentionText(container: HTMLElement, text: string): void {
+  const re = /@\[([^\]]+)\]\(([^)]+)\)/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    if (match.index > last) {
+      container.appendChild(document.createTextNode(text.slice(last, match.index)));
+    }
+    const name = match[1];
+    const ref = match[2];
+    if (ref.startsWith('b:')) {
+      const boardId = ref.slice(2);
+      const chip = document.createElement('span');
+      chip.className = 'board-mention';
+      chip.dataset.boardId = boardId;
+      chip.textContent = '@' + name;
+      if (state.boards.some(b => b.id === boardId)) {
+        chip.addEventListener('click', (e) => { e.stopPropagation(); showBoardView(boardId); });
+      }
+      container.appendChild(chip);
+    } else {
+      const chip = document.createElement('span');
+      chip.className = 'user-mention';
+      chip.dataset.userId = ref;
+      if (currentProfile && ref === currentProfile.id) chip.classList.add('is-me');
+      chip.textContent = '@' + name;
+      container.appendChild(chip);
+    }
+    last = re.lastIndex;
+  }
+  if (last < text.length) {
+    container.appendChild(document.createTextNode(text.slice(last)));
+  }
+}
+
 function renderCommentEl(c: CommentWithAuthor, canDelete: boolean, onDelete: () => void): HTMLElement {
   const item = document.createElement('div');
   item.className = 'comment-item';
@@ -5350,7 +5503,7 @@ function renderCommentEl(c: CommentWithAuthor, canDelete: boolean, onDelete: () 
 
   const text = document.createElement('div');
   text.className = 'comment-text';
-  text.textContent = c.content;
+  appendMentionText(text, c.content);
 
   body.append(meta, text);
   item.append(avatar, body);
@@ -5416,11 +5569,14 @@ async function showCommentPopover(itemEl: HTMLElement, itemId: string) {
   });
 
   const doSend = async () => {
-    const text = input.value.trim();
-    if (!text || !currentProfile) return;
+    const raw = input.value.trim();
+    if (!raw || !currentProfile) return;
+    const tracked = ((input as any).__mentions as ComposeMention[] | undefined) || [];
+    const text = serializeMentions(raw, tracked);
     sendBtn.disabled = true;
     input.value = '';
     input.style.height = '';
+    (input as any).__mentions = [];
 
     const comment = await addComment(boardId, itemId, currentProfile.id, text);
     if (comment) {
@@ -5437,6 +5593,8 @@ async function showCommentPopover(itemEl: HTMLElement, itemId: string) {
 
   sendBtn.addEventListener('click', doSend);
   input.addEventListener('keydown', (e) => {
+    // Let the mention menu take arrows / Enter / Tab / Escape while it's open
+    if (handleMentionKeydown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       doSend();
@@ -5512,7 +5670,10 @@ async function showCommentPopover(itemEl: HTMLElement, itemId: string) {
   let outsideListener: ((e: MouseEvent) => void) | null = null;
   setTimeout(() => {
     outsideListener = (e: MouseEvent) => {
-      if (!popup.contains(e.target as HTMLElement)) {
+      const target = e.target as HTMLElement;
+      // Clicks inside the mention menu must not close the popover
+      if (mentionMenu && mentionMenu.el.contains(target)) return;
+      if (!popup.contains(target)) {
         closeCommentPopover();
       }
     };
@@ -5521,6 +5682,7 @@ async function showCommentPopover(itemEl: HTMLElement, itemId: string) {
 
   _commentPopoverCleanup = () => {
     popup.remove();
+    closeMentionMenu();
     if (outsideListener) window.removeEventListener('mousedown', outsideListener, true);
     (window as any).__commentPopoverHandler = null;
   };

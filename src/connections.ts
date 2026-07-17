@@ -8,28 +8,44 @@ export function getCenter(item: BoardItem): { x: number; y: number } {
   };
 }
 
-/** Find the best anchor point on an item's edge facing toward a target point */
+/** Find the best anchor point on an item's edge facing toward a target point.
+ *  Rotation-aware: the edge point is computed in the item's local (unrotated)
+ *  frame, then rotated back into board space so it lands on the rotated edge. */
 export function getAnchor(item: BoardItem, target: { x: number; y: number }): { x: number; y: number } {
   const cx = item.position.x + item.size.w / 2;
   const cy = item.position.y + item.size.h / 2;
-  const dx = target.x - cx;
-  const dy = target.y - cy;
-
-  // Determine which edge to connect from
   const hw = item.size.w / 2;
   const hh = item.size.h / 2;
+  const rot = item.rotation || 0;
 
-  if (Math.abs(dx) * hh > Math.abs(dy) * hw) {
-    // Left or right edge
-    return dx > 0
-      ? { x: item.position.x + item.size.w, y: cy }
-      : { x: item.position.x, y: cy };
-  } else {
-    // Top or bottom edge
-    return dy > 0
-      ? { x: cx, y: item.position.y + item.size.h }
-      : { x: cx, y: item.position.y };
+  // Target relative to center, mapped into the item's local frame.
+  let dx = target.x - cx;
+  let dy = target.y - cy;
+  if (rot) {
+    const rad = -rot * Math.PI / 180;
+    const cos = Math.cos(rad), sin = Math.sin(rad);
+    const lx = dx * cos - dy * sin;
+    const ly = dx * sin + dy * cos;
+    dx = lx; dy = ly;
   }
+
+  // Local edge point.
+  let ex: number, ey: number;
+  if (Math.abs(dx) * hh > Math.abs(dy) * hw) {
+    ex = dx > 0 ? hw : -hw;
+    ey = 0;
+  } else {
+    ex = 0;
+    ey = dy > 0 ? hh : -hh;
+  }
+
+  // Rotate the local edge point back into board space.
+  if (rot) {
+    const rad = rot * Math.PI / 180;
+    const cos = Math.cos(rad), sin = Math.sin(rad);
+    return { x: cx + ex * cos - ey * sin, y: cy + ex * sin + ey * cos };
+  }
+  return { x: cx + ex, y: cy + ey };
 }
 
 /** Build a quadratic bezier path between two items */
