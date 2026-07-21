@@ -20,12 +20,24 @@ import {
   isHtml,
   plainTextToHtml,
   updateUndoRedoButtons,
+  setViewerProfile,
 } from './render';
 import { createMinimap } from './minimap';
 import { calcSnap, initGuideLayer, drawGuides, clearGuides } from './snap';
 import { createConnectionLayer, getCenter, getAnchor } from './connections';
 import { generateId } from './items';
 import { saveImage, migrateInlineImages, isIdbRef, getImage } from './imageStore';
+import {
+  saveOriginalFromHandle,
+  saveOriginalBlob,
+  replaceOriginal,
+  getOriginalFile,
+  getOriginalStatus,
+  requestOriginalPermission,
+  revokeAllOriginalUrls,
+  requestPersistentStorage,
+  supportsFileHandles,
+} from './originalStore';
 import { supabase } from './supabase';
 import { initAuth, getAuth, signOut } from './auth';
 import { renderLogin } from './loginView';
@@ -103,6 +115,9 @@ function toggleTheme() {
   }
 }
 initTheme();
+
+// Ask the browser not to evict our local data (originals live there)
+void requestPersistentStorage();
 
 // Migrate inline base64 images to IndexedDB (runs once, transparent)
 migrateInlineImages(state.boards).then(migrated => {
@@ -499,10 +514,17 @@ function addSubBoardAtCenter() {
   rerender();
 }
 
-const FRAME_PRESETS = [
+/** Fixed-size frame formats, shared by the creation menu and the
+ *  "change format" menu on a frame's title bar. */
+const FRAME_FORMATS = [
+  { label: '1:1 Quadrado', w: 1080, h: 1080 },
   { label: '16:9 Paisagem', w: 960, h: 540 },
   { label: '9:16 Retrato', w: 540, h: 960 },
   { label: 'A4', w: 595, h: 842 },
+];
+
+const FRAME_PRESETS = [
+  ...FRAME_FORMATS,
   { label: 'Livre', w: 0, h: 0 },
 ];
 
@@ -566,6 +588,144 @@ function startFrameDrawMode(preset: { w: number; h: number } | null) {
   document.querySelectorAll('#sidebar .sidebar-btn').forEach(b => b.classList.remove('active'));
   const btn = document.querySelector('.sidebar-btn[data-tooltip*="Frame"]') as HTMLElement | null;
   btn?.classList.add('active');
+}
+
+/**
+ * Inline-edit a link item's title. Creates the title element on the fly when the
+ * item doesn't have one yet, so no rerender is needed before focusing it.
+ */
+function startLinkTitleEdit(itemId: string) {
+  const item = findItem(itemId);
+  if (!item || item.type !== 'link' || item.locked || isReadOnly()) return;
+
+  const itemEl = layer.querySelector(`[data-item-id="${itemId}"]`) as HTMLElement | null;
+  const info = itemEl?.querySelector('.item-link-info') as HTMLElement | null;
+  if (!itemEl || !info) return;
+
+  itemEl.querySelector('.link-title-btn')?.remove();
+
+  let titleEl = info.querySelector('.item-link-title') as HTMLElement | null;
+  if (!titleEl) {
+    titleEl = document.createElement('div');
+    titleEl.className = 'item-link-title';
+    info.prepend(titleEl);
+  }
+  if (titleEl.dataset.editing) return;   // already editing
+
+  const previous = item.title || '';
+  titleEl.dataset.editing = '1';
+  titleEl.contentEditable = 'true';
+  titleEl.classList.add('editing');
+  titleEl.focus();
+
+  const sel = window.getSelection();
+  if (sel) {
+    sel.selectAllChildren(titleEl);
+    sel.collapseToEnd();
+  }
+
+  // Keep the canvas from starting a drag / hijacking keys while editing
+  const stopDrag = (ev: MouseEvent) => ev.stopPropagation();
+  titleEl.addEventListener('mousedown', stopDrag);
+
+  let finished = false;
+  const finish = (commitEdit: boolean) => {
+    if (finished) return;
+    finished = true;
+    titleEl!.removeEventListener('mousedown', stopDrag);
+    titleEl!.removeEventListener('keydown', onKey);
+    titleEl!.removeEventListener('blur', onBlur);
+    titleEl!.contentEditable = 'false';
+    titleEl!.classList.remove('editing');
+    delete titleEl!.dataset.editing;
+
+    const text = (titleEl!.textContent || '').trim();
+    item.title = commitEdit ? (text || undefined) : (previous || undefined);
+    commit();
+    rerender();
+  };
+
+  const onKey = (ev: KeyboardEvent) => {
+    ev.stopPropagation();
+    if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
+  };
+  const onBlur = () => finish(true);
+
+  titleEl.addEventListener('keydown', onKey);
+  titleEl.addEventListener('blur', onBlur);
+}
+
+/** Padding kept between a frame's edge and the items it wraps */
+const FRAME_CONTENT_PADDING = 40;
+
+/** Bounding box of a set of items, or null when empty */
+function itemsBBox(items: BoardItem[]): { x: number; y: number; w: number; h: number } | null {
+  if (items.length === 0) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const i of items) {
+    minX = Math.min(minX, i.position.x);
+    minY = Math.min(minY, i.position.y);
+    maxX = Math.max(maxX, i.position.x + i.size.w);
+    maxY = Math.max(maxY, i.position.y + i.size.h);
+  }
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/** Wrap the current selection in a new frame (items are adopted geometrically) */
+function createFrameFromSelection() {
+  const items = getSelectedItems().filter(i => i.type !== 'frame');
+  const bbox = itemsBBox(items);
+  if (!bbox) return;
+
+  const frame = createItem(
+    'frame',
+    { x: bbox.x - FRAME_CONTENT_PADDING, y: bbox.y - FRAME_CONTENT_PADDING },
+    'Frame'
+  );
+  frame.size = {
+    w: bbox.w + FRAME_CONTENT_PADDING * 2,
+    h: bbox.h + FRAME_CONTENT_PADDING * 2,
+  };
+  getActiveBoard().items.push(frame);
+  selectOnly(frame.id);
+  commit();
+  rerender();
+}
+
+/**
+ * Re-shape a frame to a target format.
+ * Items inside keep their position and size; the frame is grown (preserving the
+ * requested proportion) whenever the preset size wouldn't contain them, and is
+ * re-centred on its content so nothing falls outside.
+ */
+function applyFrameFormat(frame: BoardItem, fmtW: number, fmtH: number) {
+  const children = getFrameChildren(frame);
+  const bbox = itemsBBox(children);
+
+  let w = fmtW;
+  let h = fmtH;
+
+  if (bbox) {
+    const needW = bbox.w + FRAME_CONTENT_PADDING * 2;
+    const needH = bbox.h + FRAME_CONTENT_PADDING * 2;
+    // Uniform scale keeps the requested aspect ratio exactly
+    const scale = Math.max(1, needW / w, needH / h);
+    w *= scale;
+    h *= scale;
+    frame.position.x = bbox.x + bbox.w / 2 - w / 2;
+    frame.position.y = bbox.y + bbox.h / 2 - h / 2;
+  } else {
+    // Empty frame: grow/shrink around its own centre
+    const cx = frame.position.x + frame.size.w / 2;
+    const cy = frame.position.y + frame.size.h / 2;
+    frame.position.x = cx - w / 2;
+    frame.position.y = cy - h / 2;
+  }
+
+  frame.size = { w, h };
+  commit();
+  rerender();
 }
 
 function exitFrameDrawMode() {
@@ -742,8 +902,13 @@ function getFrameChildren(frame: BoardItem): BoardItem[] {
   });
 }
 
-async function addImageFromFile(file: File, screenX?: number, screenY?: number) {
-  const { dataUrl, width, height } = await compressImage(file);
+async function addImageFromFile(
+  file: File,
+  screenX?: number,
+  screenY?: number,
+  handle?: FileSystemFileHandle
+) {
+  const { dataUrl, width, height, originalWidth, originalHeight } = await compressImage(file);
 
   // Upload to Supabase Storage if logged in, fall back to IndexedDB
   let ref: string;
@@ -753,6 +918,18 @@ async function addImageFromFile(file: File, screenX?: number, screenY?: number) 
     ref = url || await saveImage(dataUrl);
   } else {
     ref = await saveImage(dataUrl);
+  }
+
+  // Keep the full-quality original on this machine only. Prefer a durable file
+  // handle (survives IndexedDB being cleared); fall back to storing the bytes
+  // when no handle exists (clipboard paste, non-Chromium browsers).
+  let originalRef: string | undefined;
+  try {
+    originalRef = handle
+      ? await saveOriginalFromHandle(handle)
+      : await saveOriginalBlob(file);
+  } catch (err) {
+    console.warn('[original] could not store original:', err);
   }
 
   // Fit item to a max board size of 320px on the longest side, keeping aspect ratio
@@ -782,8 +959,159 @@ async function addImageFromFile(file: File, screenX?: number, screenY?: number) 
 
   const item = createItem('image', pos, ref);
   item.size = { w: itemW, h: itemH };
+  if (originalRef) {
+    item.originalRef = originalRef;
+    item.originalMeta = {
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      lastModified: file.lastModified,
+      width: originalWidth,
+      height: originalHeight,
+    };
+    if (currentProfile) item.originalOwner = currentProfile.id;
+  }
   getActiveBoard().items.push(item);
   selectOnly(item.id);
+  commit();
+  rerender();
+}
+
+/**
+ * Pick image file(s) to import. Uses showOpenFilePicker when available so we get
+ * a durable FileSystemFileHandle for the original; falls back to a plain input.
+ */
+async function pickImageFiles(): Promise<void> {
+  if (supportsFileHandles()) {
+    try {
+      const handles: FileSystemFileHandle[] = await (window as any).showOpenFilePicker({
+        multiple: true,
+        types: [{
+          description: 'Imagens',
+          accept: { 'image/*': ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif'] },
+        }],
+      });
+      for (const handle of handles) {
+        const file = await handle.getFile();
+        await addImageFromFile(file, undefined, undefined, handle);
+      }
+      return;
+    } catch {
+      return;   // user cancelled the picker
+    }
+  }
+
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.multiple = true;
+  input.style.display = 'none';
+  input.addEventListener('change', async () => {
+    for (const file of Array.from(input.files || [])) {
+      await addImageFromFile(file);
+    }
+    input.remove();
+  });
+  document.body.appendChild(input);
+  input.click();
+}
+
+/** Pick a single image, returning the file plus a durable handle when possible. */
+async function pickSingleImage(): Promise<{ file: File; handle?: FileSystemFileHandle } | null> {
+  if (supportsFileHandles()) {
+    try {
+      const [handle]: FileSystemFileHandle[] = await (window as any).showOpenFilePicker({
+        multiple: false,
+        types: [{
+          description: 'Imagens',
+          accept: { 'image/*': ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif'] },
+        }],
+      });
+      if (!handle) return null;
+      return { file: await handle.getFile(), handle };
+    } catch {
+      return null;   // cancelled
+    }
+  }
+
+  return new Promise(resolve => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.style.display = 'none';
+    input.addEventListener('change', () => {
+      const file = input.files?.[0];
+      input.remove();
+      resolve(file ? { file } : null);
+    });
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
+/**
+ * Re-grant read permission for every pending original on the active board.
+ * Handles go back to "prompt" after a reload, and requestPermission needs a user
+ * gesture — doing them in one pass keeps it to a single interaction.
+ */
+async function reconnectOriginals(): Promise<void> {
+  const board = getActiveBoard();
+  const refs: string[] = [];
+  for (const item of board.items) {
+    if (!item.originalRef) continue;
+    if (await getOriginalStatus(item.originalRef) === 'needs-permission') {
+      refs.push(item.originalRef);
+    }
+  }
+  if (refs.length === 0) return;
+  await requestOriginalPermission(refs);
+  rerender();
+}
+
+/** Attach or replace the local original behind an image item. */
+async function attachOriginalTo(itemId: string): Promise<void> {
+  const item = findItem(itemId);
+  if (!item || item.type !== 'image') return;
+
+  const picked = await pickSingleImage();
+  if (!picked) return;
+  const { file, handle } = picked;
+
+  // Warn when the chosen file doesn't look like the one we recorded
+  const meta = item.originalMeta;
+  if (meta && (meta.name !== file.name || meta.size !== file.size)) {
+    const ok = confirm(
+      `O arquivo escolhido não parece ser o original registrado.\n\n` +
+      `Registrado: ${meta.name} (${Math.round(meta.size / 1024)} KB)\n` +
+      `Escolhido:  ${file.name} (${Math.round(file.size / 1024)} KB)\n\n` +
+      `Usar assim mesmo?`
+    );
+    if (!ok) return;
+  }
+
+  const dims = await new Promise<{ w: number; h: number }>(resolve => {
+    const url = URL.createObjectURL(file);
+    const probe = new Image();
+    probe.onload = () => { resolve({ w: probe.naturalWidth, h: probe.naturalHeight }); URL.revokeObjectURL(url); };
+    probe.onerror = () => { resolve({ w: 0, h: 0 }); URL.revokeObjectURL(url); };
+    probe.src = url;
+  });
+
+  if (item.originalRef) {
+    await replaceOriginal(item.originalRef, handle ?? file);
+  } else {
+    item.originalRef = handle ? await saveOriginalFromHandle(handle) : await saveOriginalBlob(file);
+  }
+  item.originalMeta = {
+    name: file.name,
+    size: file.size,
+    type: file.type,
+    lastModified: file.lastModified,
+    width: dims.w,
+    height: dims.h,
+  };
+  if (currentProfile) item.originalOwner = currentProfile.id;
+
   commit();
   rerender();
 }
@@ -1320,15 +1648,26 @@ async function loadExportImages(items: BoardItem[]): Promise<Map<string, HTMLIma
     if (item.type === 'image' && item.content) {
       promises.push((async () => {
         let src = item.content;
-        if (isIdbRef(src)) {
+        let objectUrl: string | null = null;
+        // Prefer the local full-quality original — this is where it matters most
+        if (item.originalRef) {
+          const blob = await getOriginalFile(item.originalRef);
+          if (blob) {
+            objectUrl = URL.createObjectURL(blob);
+            src = objectUrl;
+          }
+        }
+        if (!objectUrl && isIdbRef(src)) {
           const dataUrl = await getImage(src);
           if (!dataUrl) return;
           src = dataUrl;
         }
         await new Promise<void>((resolve) => {
           const img = new Image();
-          img.onload = () => { imgMap.set(item.id, img); resolve(); };
-          img.onerror = () => resolve();
+          // Safe to revoke once decoded — the element keeps the bitmap
+          const done = () => { if (objectUrl) URL.revokeObjectURL(objectUrl); resolve(); };
+          img.onload = () => { imgMap.set(item.id, img); done(); };
+          img.onerror = done;
           img.src = src;
         });
       })());
@@ -2095,7 +2434,7 @@ function updateConnections() {
 
 renderSidebar(boardView, {
   onAddText: addTextAtCenter,
-  onAddImage: addImageFromFile,
+  onPickImage: pickImageFiles,
   onAddColor: addColorAtCenter,
   onAddLink: () => addLinkAtCenter(),
   onAddNote: addNoteAtCenter,
@@ -2248,6 +2587,9 @@ function showBoardView(boardId: string, skipHistory = false) {
       boardNavHistory.push(state.activeBoardId);
     }
   }
+
+  // Release object URLs of the previous board's originals before rebuilding
+  if (state.activeBoardId !== boardId) revokeAllOriginalUrls();
 
   state.activeBoardId = boardId;
   currentView = 'board';
@@ -2669,6 +3011,7 @@ function refreshHome() {
       await signOut();
       leaveBoard();
       currentProfile = null;
+      setViewerProfile(null);
       showLoginScreen();
     },
     isAdmin: currentProfile?.is_admin ?? false,
@@ -2690,6 +3033,7 @@ function showLoginScreen() {
   renderLogin(loginScreen, async () => {
     const auth = getAuth();
     currentProfile = auth.profile;
+    setViewerProfile(currentProfile?.id ?? null);
     loginScreen.style.display = 'none';
     await loadRemoteBoards();
     refreshHome();
@@ -3153,6 +3497,7 @@ async function enterPublicView(token: string): Promise<boolean> {
     const auth = await initAuth();
     if (auth.session && auth.profile) {
       currentProfile = auth.profile;
+      setViewerProfile(currentProfile?.id ?? null);
       loginScreen.style.display = 'none';
       await loadRemoteBoards();
       refreshHome();
@@ -3190,6 +3535,44 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
     e.stopPropagation();
     const parentItemEl = linkEl.closest('[data-item-id]') as HTMLElement | null;
     if (parentItemEl) showLinkPreview(linkEl, parentItemEl);
+    return;
+  }
+
+  // Link title: "+ título" button, or clicking an existing title on a selected item.
+  // preventDefault is essential: the default mousedown focus change would blur the
+  // freshly-focused contentEditable and end the edit before it starts.
+  const addTitleBtn = target.closest('.link-title-btn') as HTMLElement | null;
+  if (addTitleBtn) {
+    e.preventDefault();
+    e.stopPropagation();
+    const itemEl = addTitleBtn.closest('[data-item-id]') as HTMLElement;
+    if (itemEl?.dataset.itemId) startLinkTitleEdit(itemEl.dataset.itemId);
+    return;
+  }
+  const titleEl = target.closest('.item-link-title') as HTMLElement | null;
+  if (titleEl && !isReadOnly()) {
+    const itemEl = titleEl.closest('[data-item-id]') as HTMLElement;
+    const tid = itemEl?.dataset.itemId;
+    // Only edit once the item is already selected — first click just selects
+    if (tid && selectedIds.has(tid)) {
+      e.preventDefault();
+      e.stopPropagation();
+      startLinkTitleEdit(tid);
+      return;
+    }
+  }
+
+  // Original-quality indicator click
+  const originalChip = target.closest('.original-indicator') as HTMLElement | null;
+  if (originalChip) {
+    e.stopPropagation();
+    const itemEl = originalChip.closest('[data-item-id]') as HTMLElement;
+    const id = itemEl?.dataset.itemId;
+    const state = originalChip.dataset.state;
+    if (id) {
+      if (state === 'needs-permission') void reconnectOriginals();
+      else if (state === 'missing') void attachOriginalTo(id);
+    }
     return;
   }
 
@@ -3257,6 +3640,10 @@ layer.addEventListener('mousedown', (e: MouseEvent) => {
     syncSelection();
     return;
   }
+
+  // Locked items are inert to pointer interaction — they can't be selected,
+  // dragged or connected. The only way back is right-click → Desbloquear.
+  if (item.locked) return;
 
   // Viewers can only select and view, not drag/resize/edit
   if (isReadOnly()) {
@@ -3458,12 +3845,57 @@ layer.addEventListener('contextmenu', (e: MouseEvent) => {
     return;
   }
 
+  // A locked item can't be selected, so right-click is the only way back in:
+  // offer just the unlock action.
+  if (item.locked) {
+    showContextMenu(e.clientX, e.clientY, [{
+      label: 'Desbloquear',
+      action: () => {
+        item.locked = undefined;
+        commit();
+        rerender();
+      }
+    }]);
+    return;
+  }
+
+  // Right-click on a frame's title bar → change its format/proportion
+  if (item.type === 'frame' && target.closest('.item-frame-title')) {
+    showContextMenu(e.clientX, e.clientY, [
+      ...FRAME_FORMATS.map(f => ({
+        label: `${f.label} (${f.w}×${f.h})`,
+        action: () => applyFrameFormat(item, f.w, f.h),
+      })),
+      {
+        label: 'Renomear frame',
+        separator: true,
+        action: () => {
+          const name = prompt('Nome do frame:', item.content || 'Frame');
+          if (name !== null) {
+            item.content = name.trim() || 'Frame';
+            commit();
+            rerender();
+          }
+        }
+      },
+    ]);
+    return;
+  }
+
   if (!selectedIds.has(id)) {
     selectOnly(id);
     syncSelection();
   }
 
-  const menuItems: { label: string; action: () => void; danger?: boolean }[] = [];
+  const menuItems: { label: string; action: () => void; danger?: boolean; separator?: boolean }[] = [];
+
+  // Wrap the selection in a new frame
+  if (selectedIds.size >= 1 && [...selectedIds].some(sid => findItem(sid)?.type !== 'frame')) {
+    menuItems.push({
+      label: 'Criar frame da seleção',
+      action: () => createFrameFromSelection()
+    });
+  }
 
   if (item.type === 'image') {
     menuItems.push({
@@ -3629,6 +4061,13 @@ layer.addEventListener('contextmenu', (e: MouseEvent) => {
     });
   }
 
+  if (item.type === 'image') {
+    menuItems.push({
+      label: item.originalRef ? 'Substituir original…' : 'Anexar original…',
+      action: () => { void attachOriginalTo(item.id); }
+    });
+  }
+
   if (item.type === 'embed') {
     menuItems.push({
       label: 'Renomear',
@@ -3790,21 +4229,6 @@ layer.addEventListener('contextmenu', (e: MouseEvent) => {
     });
   }
 
-  // Organize (auto-tidy) options when 2+ items selected
-  if (selectedIds.size >= 2) {
-    menuItems.push({
-      label: 'Organizar →',
-      action: () => {
-        const organizeMenu: { label: string; action: () => void; separator?: boolean }[] = [
-          { label: 'Organização automática', action: () => organizeSnapToGrid() },
-          { label: 'Alinhamento horizontal', action: () => alignItems('center-v'), separator: true },
-          { label: 'Alinhamento vertical', action: () => alignItems('center-h') },
-        ];
-        showContextMenu(e.clientX + 150, e.clientY, organizeMenu);
-      }
-    });
-  }
-
   // Group / Ungroup
   if (selectedIds.size >= 2) {
     const anyGrouped = [...selectedIds].some(sid => findItem(sid)?.groupId);
@@ -3866,8 +4290,26 @@ layer.addEventListener('contextmenu', (e: MouseEvent) => {
 
 const canvas = canvasEl;
 
+// Right-click on empty canvas — the escape hatch for locked items, which can't
+// be selected and so are only reachable through a context menu.
 canvas.addEventListener('contextmenu', (e: MouseEvent) => {
   e.preventDefault();
+  if (isReadOnly()) return;
+  // Clicks on an item are handled by the layer's own contextmenu listener
+  if ((e.target as HTMLElement).closest('[data-item-id]')) return;
+
+  const board = getActiveBoard();
+  const locked = board.items.filter(i => i.locked);
+  if (locked.length === 0) return;
+
+  showContextMenu(e.clientX, e.clientY, [{
+    label: `Desbloquear todos (${locked.length})`,
+    action: () => {
+      for (const item of locked) item.locked = undefined;
+      commit();
+      rerender();
+    }
+  }]);
 });
 
 canvas.addEventListener('mousedown', (e: MouseEvent) => {
@@ -4282,6 +4724,9 @@ window.addEventListener('mousemove', (e: MouseEvent) => {
 
       const board = getActiveBoard();
       for (const item of board.items) {
+        // Locked items are not selectable
+        if (item.locked) continue;
+
         // Skip dimmed items (tag filter active)
         if (activeTagFilters.size > 0) {
           const tags = item.tags || [];
@@ -4294,13 +4739,16 @@ window.addEventListener('mousemove', (e: MouseEvent) => {
         const ix2 = item.position.x + item.size.w;
         const iy2 = item.position.y + item.size.h;
 
-        const overlaps =
-          ix1 < lassoRect.x2 &&
-          ix2 > lassoRect.x1 &&
-          iy1 < lassoRect.y2 &&
-          iy2 > lassoRect.y1;
+        // Frames need to be fully inside the marquee, otherwise selecting items
+        // *within* a frame would always drag the frame along. Everything else
+        // selects on mere overlap.
+        const hit = item.type === 'frame'
+          ? (ix1 >= lassoRect.x1 && ix2 <= lassoRect.x2 &&
+             iy1 >= lassoRect.y1 && iy2 <= lassoRect.y2)
+          : (ix1 < lassoRect.x2 && ix2 > lassoRect.x1 &&
+             iy1 < lassoRect.y2 && iy2 > lassoRect.y1);
 
-        if (overlaps) {
+        if (hit) {
           selectedIds.add(item.id);
         } else if (!e.shiftKey) {
           selectedIds.delete(item.id);
@@ -5165,6 +5613,8 @@ layer.addEventListener('dblclick', (e: MouseEvent) => {
 layer.addEventListener('dblclick', (e: MouseEvent) => {
   if (isReadOnly()) return;
   if (editingId) return;
+  // Editing a link's title must not also trigger "open link"
+  if ((e.target as HTMLElement).closest('.item-link-title')) { e.stopPropagation(); return; }
   const itemEl = (e.target as HTMLElement).closest('[data-item-id]') as HTMLElement | null;
   if (!itemEl) return;
   const id = itemEl.dataset.itemId!;
@@ -5220,13 +5670,35 @@ canvas.addEventListener('drop', (e: DragEvent) => {
   if (isReadOnly()) return;
   const files = e.dataTransfer?.files;
   if (!files) return;
-  for (const file of Array.from(files)) {
-    if (file.type.startsWith('image/')) {
-      addImageFromFile(file, e.clientX, e.clientY);
-    } else if (file.name.endsWith('.html') || file.name.endsWith('.htm')) {
-      addEmbedFromFile(file, e.clientX, e.clientY);
-    }
+
+  // Chromium exposes a durable handle for dropped files — grab it so the
+  // original stays recoverable. Must read dataTransfer.items synchronously,
+  // before any await, since the DataTransfer is cleared after the handler.
+  const dropX = e.clientX;
+  const dropY = e.clientY;
+  const handlePromises: (Promise<FileSystemHandle | null> | null)[] = [];
+  const items = e.dataTransfer?.items;
+  for (let i = 0; i < files.length; i++) {
+    const entry = items?.[i] as any;
+    handlePromises.push(
+      entry && typeof entry.getAsFileSystemHandle === 'function'
+        ? entry.getAsFileSystemHandle().catch(() => null)
+        : null
+    );
   }
+
+  void (async () => {
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (file.type.startsWith('image/')) {
+        const h = await (handlePromises[i] ?? Promise.resolve(null));
+        const fileHandle = h && h.kind === 'file' ? (h as FileSystemFileHandle) : undefined;
+        await addImageFromFile(file, dropX, dropY, fileHandle);
+      } else if (file.name.endsWith('.html') || file.name.endsWith('.htm')) {
+        await addEmbedFromFile(file, dropX, dropY);
+      }
+    }
+  })();
 });
 
 // --- Paste from clipboard (system or internal) ---
@@ -6651,23 +7123,6 @@ function layoutWrap() {
   rerender();
 }
 
-// Grid step for "encaixe em grade" — matches the canvas' visible 24px grid dots.
-const ORGANIZE_GRID = 24;
-
-/** Automatic organization: snap each selected item's top-left to the nearest
- *  grid point. Keeps everything essentially in place while removing small
- *  misalignments so the layout reads as tidy. */
-function organizeSnapToGrid() {
-  const items = getSelectedItems();
-  if (items.length < 2) return;
-  for (const item of items) {
-    item.position.x = Math.round(item.position.x / ORGANIZE_GRID) * ORGANIZE_GRID;
-    item.position.y = Math.round(item.position.y / ORGANIZE_GRID) * ORGANIZE_GRID;
-  }
-  commit();
-  rerender();
-}
-
 function toggleLockSelected() {
   if (selectedIds.size === 0) return;
   // If any selected is unlocked, lock all; otherwise unlock all
@@ -6709,8 +7164,12 @@ window.addEventListener('keydown', (e: KeyboardEvent) => {
     return;
   }
 
+  // Holding Shift makes e.key report the upper-case letter ('Z', not 'z'),
+  // so compare against a normalised copy for the shortcuts that use Shift.
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+
   // Undo
-  if (ctrl && e.key === 'z' && !e.shiftKey) {
+  if (ctrl && key === 'z' && !e.shiftKey) {
     e.preventDefault();
     const board = undo();
     if (board) {
@@ -6720,8 +7179,8 @@ window.addEventListener('keydown', (e: KeyboardEvent) => {
     return;
   }
 
-  // Redo
-  if (ctrl && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+  // Redo — Ctrl+Y or Ctrl+Shift+Z
+  if (ctrl && (key === 'y' || (key === 'z' && e.shiftKey))) {
     e.preventDefault();
     const board = redo();
     if (board) {
@@ -6945,6 +7404,7 @@ window.addEventListener('keydown', (e: KeyboardEvent) => {
     e.preventDefault();
     const board = getActiveBoard();
     for (const item of board.items) {
+      if (item.locked) continue;   // locked items are not selectable
       selectedIds.add(item.id);
     }
     syncSelection();

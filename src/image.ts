@@ -3,12 +3,19 @@
  *
  * Every image imported into the board goes through `compressImage()` which
  * resizes it to fit within MAX_DIM and re-encodes it as JPEG (or keeps PNG
- * for transparent images).  This keeps localStorage light and board switching
- * fast even with many images.
+ * for transparent images).  Board items only ever store a reference (Storage
+ * URL or idb://), never the pixels, so these limits govern storage quota and
+ * per-image network/decode cost rather than board load time.
+ *
+ * MAX_DIM is deliberately well above the on-canvas size (ITEM_MAX = 320px in
+ * main.ts): at the 500% max zoom a 320px item paints at 1600px, so 2000px of
+ * source keeps some headroom instead of sitting exactly at the limit.
  */
 
-const MAX_DIM = 1600;   // px – longest side
-const JPEG_QUALITY = 0.82;
+const MAX_DIM = 2000;   // px – longest side
+const JPEG_QUALITY = 0.88;
+/** Above this, re-encode even when the image already fits MAX_DIM (see below) */
+const SKIP_RECOMPRESS_MAX_BYTES = 1_500_000;
 
 export interface CompressedImage {
   dataUrl: string;
@@ -16,6 +23,10 @@ export interface CompressedImage {
   width: number;
   /** Natural height after resize */
   height: number;
+  /** Width of the source file before any resize */
+  originalWidth: number;
+  /** Height of the source file before any resize */
+  originalHeight: number;
 }
 
 /**
@@ -88,11 +99,13 @@ export async function compressImage(file: File): Promise<CompressedImage> {
   const transparent = isPng && hasTransparency(img);
   const mime = transparent ? 'image/png' : 'image/jpeg';
 
-  // If image is small enough and already JPEG, skip re-encoding
+  // If the image already fits and is already JPEG, skip re-encoding to avoid a
+  // second lossy pass.  Guarded by file size: dimensions alone would let a
+  // heavyweight JPEG (e.g. 1900px saved at q100, several MB) through untouched.
   const alreadySmall = targetW === w && targetH === h;
   const alreadyJpeg = file.type === 'image/jpeg';
-  if (alreadySmall && alreadyJpeg) {
-    return { dataUrl: rawUrl, width: w, height: h };
+  if (alreadySmall && alreadyJpeg && file.size <= SKIP_RECOMPRESS_MAX_BYTES) {
+    return { dataUrl: rawUrl, width: w, height: h, originalWidth: w, originalHeight: h };
   }
 
   // Draw to canvas at target size
@@ -111,5 +124,5 @@ export async function compressImage(file: File): Promise<CompressedImage> {
 
   const dataUrl = cvs.toDataURL(mime, mime === 'image/jpeg' ? JPEG_QUALITY : undefined);
 
-  return { dataUrl, width: targetW, height: targetH };
+  return { dataUrl, width: targetW, height: targetH, originalWidth: w, originalHeight: h };
 }

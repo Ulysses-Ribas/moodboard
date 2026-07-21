@@ -1,8 +1,21 @@
+/** Identifying details of a locally-held original image, used to find/verify it again */
+export interface OriginalMeta {
+  name: string;
+  size: number;
+  type: string;
+  lastModified: number;
+  /** Dimensions of the ORIGINAL file, not of the compressed proxy */
+  width: number;
+  height: number;
+}
+
 export interface BoardItem {
   id: string;
   type: 'image' | 'text' | 'link' | 'color' | 'note' | 'frame' | 'board' | 'draw' | 'embed';
   content: string;
   color?: string;
+  /** Optional display title (link items) shown above the domain */
+  title?: string;
   /** Stroke width for draw items */
   strokeWidth?: number;
   sourceUrl?: string;
@@ -11,6 +24,15 @@ export interface BoardItem {
   size: { w: number; h: number };
   /** Rotation in degrees, applied around the item's center (absent/0 = unrotated) */
   rotation?: number;
+  /**
+   * Key into the LOCAL originals store (`orig://<uuid>`) holding the full-quality
+   * source image. Deliberately kept out of `content` so the sync layer never
+   * uploads it — only the compressed proxy in `content` reaches the server.
+   */
+  originalRef?: string;
+  originalMeta?: OriginalMeta;
+  /** Profile that imported the original — others never have the local file */
+  originalOwner?: string;
   /** Profile IDs mentioned in this item's text/note content */
   mentions?: string[];
   tags?: string[];

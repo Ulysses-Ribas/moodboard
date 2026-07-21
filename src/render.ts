@@ -1,6 +1,15 @@
 import type { Board, BoardItem, BoardState } from './types';
 import { isIdbRef, getImage } from './imageStore';
+import { getOriginalUrl, peekOriginalUrl, getOriginalStatus } from './originalStore';
 import { getCommentCount } from './comments';
+
+/** Who is viewing — originals are per-machine, so "missing" is only meaningful
+ *  to the person who imported them. Set from main.ts once the profile is known. */
+let viewerProfileId: string | null = null;
+
+export function setViewerProfile(id: string | null): void {
+  viewerProfileId = id;
+}
 
 /** Detect whether a string contains HTML tags */
 export function isHtml(str: string): boolean {
@@ -85,7 +94,9 @@ function svgEl(paths: string, viewBox = '0 0 24 24'): string {
 export interface SidebarCallbacks {
   onSelect: () => void;
   onAddText: () => void;
-  onAddImage: (file: File) => void;
+  /** Opens the image picker — implemented in main.ts so the File System Access
+   *  logic (durable handles for originals) lives in one place. */
+  onPickImage: () => void;
   onAddColor: () => void;
   onAddLink: () => void;
   onAddNote: () => void;
@@ -127,16 +138,7 @@ export function renderSidebar(
   btnImage.dataset.tooltip = 'Adicionar imagem';
   btnImage.innerHTML = svgEl('M21 19V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2z M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z M21 15l-5-5L5 21');
 
-  const fileInput = document.createElement('input');
-  fileInput.type = 'file';
-  fileInput.accept = 'image/*';
-  fileInput.style.display = 'none';
-  fileInput.addEventListener('change', () => {
-    const file = fileInput.files?.[0];
-    if (file) cb.onAddImage(file);
-    fileInput.value = '';
-  });
-  btnImage.addEventListener('click', () => fileInput.click());
+  btnImage.addEventListener('click', () => cb.onPickImage());
 
   // Color tool
   const btnColor = document.createElement('button');
@@ -201,7 +203,7 @@ export function renderSidebar(
   btnConnect.innerHTML = svgEl('M8 12h8 M16 8l4 4-4 4 M4 8a4 4 0 0 1 0 8');
   btnConnect.addEventListener('click', cb.onConnect);
 
-  sidebar.append(btnSelect, sep0, btnText, btnImage, btnColor, btnLink, btnDraw, fileInput, sep, btnFrame, btnBoard, btnEmbed, embedInput, btnConnect);
+  sidebar.append(btnSelect, sep0, btnText, btnImage, btnColor, btnLink, btnDraw, sep, btnFrame, btnBoard, btnEmbed, embedInput, btnConnect);
   container.prepend(sidebar);
   return sidebar;
 }
@@ -679,13 +681,29 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
 
   if (item.type === 'image') {
     const img = document.createElement('img');
-    if (isIdbRef(item.content)) {
+    // Show the proxy right away, then upgrade to the local original if we have
+    // one — progressive, so the item never renders blank while we resolve it.
+    const cachedOriginal = item.originalRef ? peekOriginalUrl(item.originalRef) : null;
+    if (cachedOriginal) {
+      img.src = cachedOriginal;
+    } else if (isIdbRef(item.content)) {
       img.dataset.idbRef = item.content;
       getImage(item.content).then(dataUrl => {
-        if (dataUrl) img.src = dataUrl;
+        if (dataUrl && !img.dataset.originalApplied) img.src = dataUrl;
       });
     } else {
       img.src = item.content;
+    }
+    if (item.originalRef && !cachedOriginal) {
+      const ref = item.originalRef;
+      getOriginalUrl(ref).then(url => {
+        if (url) {
+          img.dataset.originalApplied = '1';
+          img.src = url;
+        }
+      });
+    } else if (cachedOriginal) {
+      img.dataset.originalApplied = '1';
     }
     img.draggable = false;
     el.appendChild(img);
@@ -729,6 +747,14 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
     const info = document.createElement('div');
     info.className = 'item-link-info';
 
+    if (item.title) {
+      const titleEl = document.createElement('div');
+      titleEl.className = 'item-link-title';
+      titleEl.textContent = item.title;
+      titleEl.title = 'Clique para editar o título';
+      info.appendChild(titleEl);
+    }
+
     const domainEl = document.createElement('div');
     domainEl.className = 'item-link-domain';
     domainEl.textContent = domain;
@@ -739,6 +765,11 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
 
     info.append(domainEl, urlEl);
     el.append(favicon, info);
+
+    // Offer to add a title while the item is selected
+    if (isSelected && !item.title) {
+      el.appendChild(makeLinkTitleBtn());
+    }
   }
 
   if (item.type === 'frame') {
@@ -872,6 +903,39 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
     el.appendChild(groupIcon);
   }
 
+  // Original-quality indicator (only on images that have a local original)
+  if (item.type === 'image' && item.originalRef) {
+    const ref = item.originalRef;
+    const chip = document.createElement('button');
+    chip.className = 'original-indicator';
+    chip.dataset.action = 'original';
+    chip.dataset.state = 'ready';
+    chip.textContent = 'ORIG';
+    chip.title = 'Exibindo o arquivo original';
+    el.appendChild(chip);
+
+    getOriginalStatus(ref).then(status => {
+      if (!chip.isConnected) return;
+      // A collaborator will never hold this machine's file — don't nag them
+      const isOwner = !item.originalOwner || item.originalOwner === viewerProfileId;
+      if (status !== 'ready' && !isOwner) { chip.remove(); return; }
+
+      chip.dataset.state = status;
+      if (status === 'ready') {
+        chip.textContent = 'ORIG';
+        chip.title = 'Exibindo o arquivo original';
+      } else if (status === 'needs-permission') {
+        chip.textContent = 'Reconectar';
+        chip.title = 'Clique para reconceder acesso ao arquivo original';
+      } else {
+        chip.textContent = 'Original ausente';
+        chip.title = item.originalMeta
+          ? `Arquivo não encontrado: ${item.originalMeta.name} — clique para substituir`
+          : 'Arquivo original não encontrado — clique para substituir';
+      }
+    });
+  }
+
   // Tags
   if (item.tags && item.tags.length > 0) {
     const tagBar = document.createElement('div');
@@ -911,6 +975,16 @@ export function renderItem(item: BoardItem, isSelected: boolean, cssZIndex?: num
   }
 
   return el;
+}
+
+/** "Add title" affordance shown on a selected link item that has no title yet */
+export function makeLinkTitleBtn(): HTMLElement {
+  const btn = document.createElement('button');
+  btn.className = 'link-title-btn';
+  btn.dataset.action = 'add-link-title';
+  btn.textContent = '+ título';
+  btn.title = 'Adicionar um título a este link';
+  return btn;
 }
 
 /** Rotation grip shown near the bottom-right corner of a selected item */
@@ -998,6 +1072,15 @@ export function syncSelectionVisual(
     const embedIframe = htmlEl.querySelector('.embed-iframe') as HTMLIFrameElement | null;
     if (embedIframe) {
       embedIframe.style.pointerEvents = isSelected ? 'auto' : 'none';
+    }
+
+    // Link "+ título" button: only while selected and with no title yet
+    if (htmlEl.classList.contains('item-link') && findItem) {
+      const existing = htmlEl.querySelector('.link-title-btn');
+      const linkItem = findItem(id);
+      const wants = isSelected && linkItem && !linkItem.title;
+      if (wants && !existing) htmlEl.appendChild(makeLinkTitleBtn());
+      else if (!wants && existing) existing.remove();
     }
 
     // Image link button: only show when selected AND has a link
